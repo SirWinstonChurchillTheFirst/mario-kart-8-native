@@ -8,6 +8,64 @@ No emulator.
 > `meta/`. The translated C++ and the program built from it contain the game's code: do not share them.
 > Not affiliated with or endorsed by Nintendo.
 
+## Selbst bauen / Build it yourself
+
+One command builds the native program from **your own dump** of Mario Kart 8. Nothing from the game is in this repository
+or downloaded by the scripts: the game's code (Turbo.rpx, mvplayer.rpl) is translated to C++ and compiled on your computer.
+*Ein Befehl baut das native Programm aus deinem eigenen Dump; nichts vom Spiel ist hier enthalten oder wird geladen.*
+
+**You need / Du brauchst**
+- your own dump of the game, **unpacked**: a folder with `code/`, `content/`, `meta/` (as Cemu or a Wii U dumper
+  such as Dumpling gives it; `.wua`/`.wud` images must be unpacked first). Tested with Europe
+  (000500001010ED00); other versions are translated from your files the same way and may work.
+- Windows 10/11 64-bit or Linux x86-64; a CPU with AVX2/FMA (Intel Haswell, AMD Zen or newer); a GPU with a Vulkan driver.
+- internet for the build tools and the pinned sources (Smash4PC `f145e7f`, ZArchive, addrlib, Vulkan-Headers from GitHub).
+- about **2 GB** free in this folder (plus about 3 GB for MSYS2 on Windows) and 8 GB of RAM or more.
+- time: about **5-15 minutes** for the first build on an 8-core PC; a second run only redoes what changed.
+
+**Miis / Mii-Dateien.** Visible Miis need the Mii resource title (`0005001B-10056000`, files `FFLRes*.dat`) from **your own Wii U** — it is not part of the game, not in this repository and never downloaded. This game does not get far without it. Give the setup a Cemu-style `mlc01/sys` folder that holds `title/0005001b/10056000/content/` (`-SysDir` on Windows, `--sys` on Linux); it is written into the starter as `CAFE_SYS_DIR` and only read.
+*Deutsch:* Sichtbare Miis brauchen den Mii-Systemtitel deiner **eigenen** Wii U (z. B. aus Cemus `mlc01/sys`), angegeben mit `-SysDir` bzw. `--sys`. Er ist nicht im Spiel-Dump und nicht hier enthalten.
+
+**Windows** (PowerShell):
+
+```powershell
+git clone https://github.com/SirWinstonChurchillTheFirst/mario-kart-8-native
+cd mario-kart-8-native
+powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1 -GameDir "D:\Games\Mario Kart 8" -SysDir "D:\Cemu\mlc01\sys"
+.\play\Start.bat
+```
+
+It installs [MSYS2](https://www.msys2.org) with winget if it is missing and the build packages into its CLANG64
+environment with pacman (clang, lld, cmake, ninja, Python, git, SDL3, Vulkan loader + headers, shaderc, zlib, zstd,
+xz, DejaVu fonts). Without `-GameDir` it asks for the folder. `-Jobs N` limits the parallel compile jobs; the build
+runs at low priority so the PC stays usable.
+
+**Linux** (Debian/Ubuntu, Arch, Fedora; others: install the same packages yourself):
+
+```bash
+git clone https://github.com/SirWinstonChurchillTheFirst/mario-kart-8-native
+cd mario-kart-8-native
+./setup-linux.sh "/path/to/Mario Kart 8" --sys ~/.local/share/Cemu/mlc01/sys
+./play/start.sh
+```
+
+Missing packages are installed with sudo (apt: clang cmake ninja-build git python3 pkg-config zlib1g-dev libzstd-dev
+libssl-dev libvulkan-dev libshaderc-dev fonts-dejavu-core, and libsdl3-dev where the distribution has it; without it
+SDL 3.2.26 is built from source, e.g. on Ubuntu 24.04). `--jobs N` limits the compile jobs.
+
+**What the setup does** (`tools/native-build.sh`, the same on both systems): checks your dump; clones
+[Smash4PC](https://github.com/josiahg2502-glitch/Smash4PC) at `f145e7f` and the three pinned dependencies; applies
+`port/upstream-local.patch` (all runtime/recompiler changes, made by the `port/patch_*.py` scripts in order); builds the
+recompiler `cafe-recomp`; translates your `code/`; compiles runtime + translated game; and puts `cafegame`, a stand-in
+font and the starter into `play/`. Everything it makes stays in `build/` and `play/` (both ignored by git): they hold
+code translated from the game — **keep them for yourself, do not share them.**
+
+The Wii U system font is not part of a game dump: DejaVu Sans stands in (`play/fonts/CafeStd.ttf`); put your console's
+own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system language follows your PC
+(`CAFE_LANGUAGE=de|en|fr|...` overrides it).
+
+**Getestet / tested (23 Nov 2026):** `setup-windows.ps1` in an empty folder on Windows 11 (i7-13700KF, RTX 3070 Ti, 8 jobs, `-SysDir` with the tester's own Mii files): video module translated and loaded, the whole build took about 3 minutes; `Start.bat`'s program went from the title through the menus into a race at Mario Kart Stadium (57-58 frames/s with picture captures on). The translation is the same as the console build's (only the newer recompiler's `dcbf` lines differ). The same scripts were run end to end from an empty folder on 23 November 2026: Lost Levels and Mario Kart 8 on Windows 11, Lost Levels on Ubuntu 26.04 and on a fresh Ubuntu 24.04 (SDL3 built from source there), Mario Party 10 on Windows 11.
+
 ## Status (23 November 2026): races run at 59-60 frames/s on a Batocera console, menu videos play
 
 | Step | State |
@@ -56,14 +114,12 @@ Wii U runtime by Petexy (MIT). All credit for the recompiler and the runtime goe
 - `tools/`: build and test helpers (`win_build.sh`, `run_gpu.sh`, `console_test.sh`, ...); `console/`: the Batocera
   launcher and deploy script.
 
-Build outline (Linux): translate `mvplayer.rpl` with `CAFE_RPL_REBASE=06000000,00300000 CAFE_DATA_IMPORT_FIRST=32`,
+By hand (what `tools/native-build.sh` does for this game): translate `mvplayer.rpl` with `CAFE_RPL_REBASE=06000000,00300000 CAFE_DATA_IMPORT_FIRST=32`,
 rename its tables with `module_rename.py`, write the map with
 `tools/make_data_imports.py <game>/code/mvplayer.rpl 00300000 mk8-data-imports.map`, translate `Turbo.rpx` with
 `CAFE_DATA_IMPORT_MAP=mk8-data-imports.map`,
 configure with `-DGAME_MODULE_DIRS=<module folder>`, `GAME_EXTRA` += `port/modules.cpp`, `-DCAFE_PORT_MODULES`, and put
 `mk8-data-imports.map` next to the program as `data-imports.map`.
-
-The system font is not part of a game dump either: copy your console's `CafeStd.ttf` to `build-NAME/fonts/`.
 
 ## License
 
