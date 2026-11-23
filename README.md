@@ -8,14 +8,14 @@ No emulator.
 > `meta/`. The translated C++ and the program built from it contain the game's code: do not share them.
 > Not affiliated with or endorsed by Nintendo.
 
-## Status (22 November 2026): races run at 58-60 frames/s on a Batocera console
+## Status (23 November 2026): races run at 59-60 frames/s on a Batocera console, menu videos play
 
 | Step | State |
 | --- | --- |
 | Title, menus, cup/character/kart select | works (PC and console) |
 | A race (Mario Kart Stadium) with the other racers | works: lit track, karts, drivers, HUD, sound |
 | Speed | console (Ryzen 3 4350GE, Vega 6): 58-60 frames/s in the race, ~45 while loading; CPU 67 C, GPU 60 C |
-| Menu preview videos | black: they are H.264 videos and the runtime has no decoder |
+| Menu preview videos | work where FFmpeg's `libavcodec` (.so.61 or .58) is installed: the runtime's H.264 decoder interface (`port/os_extra.cpp`, `patch_h264.py`) hands the stream to it at run time; without it the frames stay black (sound plays) |
 | Online, Mario Kart TV upload | not available |
 
 **Miis.** The game asks for the Wii U's Mii resources (system title `0005001B-10056000`). They are **not** part of
@@ -38,6 +38,8 @@ the game and **not** included here: point `CAFE_SYS_DIR` at a Cemu-style `mlc01/
   - an invalid cube view for a 48-face cube texture (`patch_cube_view.py`).
 - **Speed on the console.** The game creates over 4000 render targets; every texture bind searched them all
   (9-14 frames/s). An address index fixes that (`patch_target_index.py`).
+- **Menu videos.** `mvplayer.rpl` drives the system's `h264` library (`H264DEC*`); `port/os_extra.cpp` implements it
+  and decodes with `libavcodec` loaded at run time (`CAFE_H264=0` / `CAFE_H264_DECODE=0` turn it off).
 - Lock-free lists need a real `lwarx`/`stwcx.` reservation (`patch_reservation.py`, found with Mario & Sonic Rio 2016).
 
 ## What is here
