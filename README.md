@@ -72,6 +72,7 @@ own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system lang
 | --- | --- |
 | Title, menus, cup/character/kart select | works (PC and console) |
 | A race (Mario Kart Stadium) with the other racers | works: lit track, karts, drivers, HUD, sound |
+| Memory | flat over 35 minutes of racing on the console (render targets freed, see below) |
 | Speed | console (Ryzen 3 4350GE, Vega 6), Grand Prix at Mario Kart Stadium: 59.6 frames/s on average in the race, slowest 10 s 58.4-58.8, longest frame 40-48 ms (no hitch over 100 ms), menus 59.9, track loading frame 300 ms (was 710-780); CPU 71-75 C, GPU 65-66 C |
 | Menu preview videos | work where FFmpeg's `libavcodec` (.so.61 or .58) is installed: the runtime's H.264 decoder interface (`port/os_extra.cpp`, `patch_h264.py`) hands the stream to it at run time; without it the frames stay black (sound plays) |
 | Online, Mario Kart TV upload | not available |
@@ -96,6 +97,20 @@ the game and **not** included here: point `CAFE_SYS_DIR` at a Cemu-style `mlc01/
     from 64 MB memory blocks (`patch_image_pool.py`, `TTT2_IMAGE_POOL=0` = old way): track loading 300 ms instead of 750;
   - `TTT2_GUEST_DMABUF=1` (set in the console's start script) makes each GPU submission cheaper.
 - Open: render targets are never freed (4250 -> 5020 in a 250 s race); very long sessions are not measured yet.
+  **Fixed the same night, see below.**
+
+## 24 November 2026 (late): memory stays flat in long sessions
+
+- **Render targets are freed** when nothing used them for 30 s and their contents are elsewhere (the CPU or a newer
+  target wrote their memory since, or they are written back to guest memory): a few a frame, their images destroyed
+  only after the GPU finished with them (`patch_target_eviction.py`, `TTT2_TARGET_EVICT=0` = old way).
+- **The shader cache no longer keeps the GLSL text** of every entry (`patch_shader_text_release.py`): the game makes
+  ~1500 new entries a minute with GLSL it already had, about 37 KB each.
+- Console, 35 minutes of Grand Prix racing over four track loads: GPU memory (GTT) 2.98 GB in the first race and
+  2.98-3.11 GB at the end (old program: 3.1 -> 3.37 GB in 21 minutes, render targets 5100 -> 8070, now 3500-5600);
+  the program's own memory 0.40 -> 0.61 GB (before: 0.34 -> 2.12 GB, 50 MB a minute); flat while racing, small steps
+  when a new track loads. Speed unchanged: race 59.8 frames/s, slowest 10 s 58.1, longest frame 47 ms; track
+  loading frames 190-310 ms (old program at the second track: 1.6 s).
 
 ## What it took
 
