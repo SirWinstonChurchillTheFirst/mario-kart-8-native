@@ -1580,7 +1580,7 @@ index 8397b1f..6675300 100644
          VkFormatProperties p;
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..c7e9cd0 100644
+index d591259..675d142 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -1847,7 +1847,7 @@ index d591259..c7e9cd0 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -759,20 +861,92 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -759,20 +861,93 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          if (vh == std::strtoull(skip, nullptr, 16)) return;
      }
  
@@ -1890,6 +1890,7 @@ index d591259..c7e9cd0 100644
 +        }
          colors[t] = color_target(base, r(reg::CB_COLOR0_SIZE + t * 4), info);
 +        if (slice != 0 && colors[t] && slice_targets_enabled()) const_cast<Target*>(colors[t])->write_back = false;
++        if (slice != 0 && colors[t] && slice_targets_enabled()) const_cast<Target*>(colors[t])->layered = true; // port/patch_target_evict_layers.py
          if (colors[t]) color_count = t + 1;
      }
 +    { // port/patch_log_targets.py
@@ -1943,7 +1944,7 @@ index d591259..c7e9cd0 100644
      }
      // A pass is clipped to its smallest attachment, the console's GPU is not:
      // a title-sized target drawn with upscaled ones is upscaled too, and an
-@@ -816,8 +990,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -816,8 +991,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      ShaderEnvironment vs_env, ps_env;
      build_environment(regs.value, Stage::kVertex, vs_env);
      build_environment(regs.value, Stage::kPixel, ps_env);
@@ -1973,7 +1974,7 @@ index d591259..c7e9cd0 100644
      const ShaderModule* ps = shader(Stage::kPixel, r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, 0, 0,
                                      ps_env);
      if (vs == nullptr || ps == nullptr) {
-@@ -832,6 +1025,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -832,6 +1026,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          VkImageView view;
          VkSampler sampler;
          bool scaled;
@@ -2009,7 +2010,7 @@ index d591259..c7e9cd0 100644
      };
      Bound vs_textures[abi::kTextureSlots]{}, ps_textures[abi::kTextureSlots]{};
      const auto bind_textures = [&](const ShaderModule* s, uint32_t resource_base, uint32_t sampler_base,
-@@ -850,7 +1072,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -850,7 +1073,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  // take, or the title relies on it): the GPU reads zeros, and
                  // the shader declared a 2D float texture. (Fallen Garden's
                  // water has such a slot; skipping the draw left no water.)
@@ -2019,7 +2020,7 @@ index d591259..c7e9cd0 100644
                  continue;
              }
              const Texture* t = texture(words);
-@@ -858,7 +1081,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -858,7 +1082,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  report_once("draw skipped: texture could not be created, format", words[1] >> 26);
                  return false;
              }
@@ -2029,7 +2030,7 @@ index d591259..c7e9cd0 100644
          }
          return true;
      };
-@@ -871,16 +1095,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -871,16 +1096,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkFormat formats[8]{};
      for (uint32_t i = 0; i < color_count; ++i) formats[i] = colors[i] ? colors[i]->image.format : VK_FORMAT_UNDEFINED;
      const VkFormat depth_format = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
@@ -2066,7 +2067,7 @@ index d591259..c7e9cd0 100644
      if (pipe->state.load() != Built::kReady) {
          ++deferred_draws_; // its pipeline still compiling
          return;
-@@ -888,7 +1131,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -888,7 +1132,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
  
      // Per-draw constants.
      abi::DrawConstants dc{};
@@ -2075,7 +2076,7 @@ index d591259..c7e9cd0 100644
      ConstantSources sources;
      for (uint32_t i = 0; i < 16; ++i) {
          if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
-@@ -957,21 +1200,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -957,21 +1201,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f * pass_scale;
      dc.pixel_scale = pass_scale;
      dc.texture_scale = target_scale();
@@ -2124,7 +2125,7 @@ index d591259..c7e9cd0 100644
      }
  
      // Indices, converted to 32-bit host order (and to triangles for quads).
-@@ -1069,6 +1336,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1337,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -2141,7 +2142,7 @@ index d591259..c7e9cd0 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1463,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1464,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -2165,7 +2166,7 @@ index d591259..c7e9cd0 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1209,7 +1501,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1209,7 +1502,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkCullModeFlags cull = 0;
      if (mode & 1) cull |= VK_CULL_MODE_FRONT_BIT;
      if (mode & 2) cull |= VK_CULL_MODE_BACK_BIT;
@@ -2175,7 +2176,7 @@ index d591259..c7e9cd0 100644
      // FACE: 0 counter-clockwise front, in the y-down window space Vulkan uses too.
      vkCmdSetFrontFace(c, (mode >> 2) & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
      vkCmdSetPrimitiveTopology(c, topology);
-@@ -1243,7 +1536,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1243,7 +1537,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          no_depth = range && count >= std::strtoul(range, nullptr, 10) &&
                     count <= std::strtoul(std::strchr(range, ',') + 1, nullptr, 10);
      }
@@ -2185,7 +2186,7 @@ index d591259..c7e9cd0 100644
      vkCmdSetDepthWriteEnable(c, has_depth && (((depth_control >> 2) & 1) || no_depth)); // (no_depth: shows its depth)
      // (no_depth: always passes, still writing depth.)
      vkCmdSetDepthCompareOp(c, no_depth ? VK_COMPARE_OP_ALWAYS : static_cast<VkCompareOp>((depth_control >> 4) & 7));
-@@ -1273,6 +1567,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1273,6 +1568,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 8) & 0xFF);
      vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 16) & 0xFF);
  
@@ -2206,7 +2207,7 @@ index d591259..c7e9cd0 100644
      if (tracing()) {
          uint64_t vh = 0, ph = 0, fh = 0;
          program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
-@@ -1285,6 +1593,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1594,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -2240,7 +2241,7 @@ index d591259..c7e9cd0 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1637,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1638,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -2266,7 +2267,7 @@ index d591259..c7e9cd0 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,10 +1667,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,10 +1668,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -2346,7 +2347,7 @@ index d591259..c7e9cd0 100644
          std::fprintf(stderr, "trace:   viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X\n", viewport.x,
                       viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x,
                       scissor.offset.y, scissor.extent.width, scissor.extent.height, mode & 7);
-@@ -1325,7 +1748,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,7 +1749,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -2355,7 +2356,7 @@ index d591259..c7e9cd0 100644
      }
      if (writes_stream_out) stream_out_pending_ = true;
      // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
-@@ -1436,6 +1859,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1436,6 +1860,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  const uint32_t w = x1 - x0, h = y1 - y0, texel = 8, bytes = w * h * texel;
                  VkDeviceSize offset = 0;
                  upload(bytes, 16, offset);
@@ -2478,7 +2479,7 @@ index ceb2ba7..899f6f7 100644
  
  } // namespace cafe::gpu::vk
 diff --git a/runtime/src/gpu/vulkan/present.cpp b/runtime/src/gpu/vulkan/present.cpp
-index 0778742..c91b088 100644
+index 0778742..52a31c2 100644
 --- a/runtime/src/gpu/vulkan/present.cpp
 +++ b/runtime/src/gpu/vulkan/present.cpp
 @@ -47,6 +47,17 @@
@@ -2499,7 +2500,20 @@ index 0778742..c91b088 100644
  
  // Enough for every image waiting for its refresh (up to a frame's lead
  // ahead), the one showing and the one being copied.
-@@ -516,7 +527,7 @@ void Renderer::present_timed(float reported_hz) {
+@@ -413,7 +424,11 @@ void Renderer::note_presentation(double scheduled, double presented) {
+     // TTT2_TRACE_STALLS=1: each gap over 100 ms between presents, on the
+     // steady clock (seconds), to line up with TTT2_TRACE_FS.
+     static const bool trace_stalls = std::getenv("TTT2_TRACE_STALLS") != nullptr;
+-    if (trace_stalls && last != 0 && presented - last > 0.1) {
++    static const double stall_s = [] { // port/patch_stall_ms.py
++        const char* v = std::getenv("TTT2_STALL_MS");
++        return v ? std::atof(v) / 1000.0 : 0.1;
++    }();
++    if (trace_stalls && last != 0 && presented - last > stall_s) {
+         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+         std::fprintf(stderr, "stall: %.3f %.0f ms\n", now, (presented - last) * 1000.0);
+     }
+@@ -516,7 +531,7 @@ void Renderer::present_timed(float reported_hz) {
              wi.semaphoreCount = 1;
              wi.pSemaphores = &timeline_;
              wi.pValues = &f.ready;
@@ -2509,7 +2523,7 @@ index 0778742..c91b088 100644
          const double ready_at = now_seconds();
          // The lead is how long frames take from their swap until the GPU has
 diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
-index c70b525..d9405e1 100644
+index c70b525..c0b43cf 100644
 --- a/runtime/src/gpu/vulkan/renderer.cpp
 +++ b/runtime/src/gpu/vulkan/renderer.cpp
 @@ -40,10 +40,28 @@ void set_tv_height(uint32_t rows) {
@@ -2868,7 +2882,7 @@ index c70b525..d9405e1 100644
  }
  
  // ------------------------------------------------------------ profiling
-@@ -612,7 +795,41 @@ void Renderer::profile_report() {
+@@ -612,7 +795,45 @@ void Renderer::profile_report() {
      }
  }
  
@@ -2883,7 +2897,11 @@ index c70b525..d9405e1 100644
 +        return (now_s.seconds >= then.seconds ? now_s.seconds - then.seconds : now_s.seconds) * 1000.0;
 +    };
 +    const double waited = wait_seconds_ >= wait0 ? wait_seconds_ - wait0 : wait_seconds_;
-+    if (last != 0 && now - last > 0.06) {
++    static const double stall_s = [] { // port/patch_stall_ms.py
++        const char* v = std::getenv("TTT2_STALL_MS");
++        return v ? std::atof(v) / 1000.0 : 0.06;
++    }();
++    if (last != 0 && now - last > stall_s) {
 +        std::fprintf(stderr,
 +                     "stall-cp: %.3f frame %llu %.0f ms: images %u made in %.1f ms (%.1f MB), textures new %u, targets new %llu, "
 +                     "submits %u in %.1f ms, GPU waits %.1f ms, translate %.1f ms, compile %.1f ms, pipelines %.1f ms, "
@@ -2910,7 +2928,7 @@ index c70b525..d9405e1 100644
      copy_write_backs(); // the frame's, before its replays render into the same targets
      capture();
      show_frame();
-@@ -655,15 +872,16 @@ void Renderer::swap() {
+@@ -655,15 +876,16 @@ void Renderer::swap() {
      }
      ++frame_number_;
      ++frames_;
@@ -2930,7 +2948,7 @@ index c70b525..d9405e1 100644
                       wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), busy_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1),
                       static_cast<unsigned long long>(blended_replays_),
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
-index 6739e5d..c20a4ce 100644
+index 6739e5d..54ab772 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
 +++ b/runtime/src/gpu/vulkan/renderer.h
 @@ -68,6 +68,8 @@ inline uint32_t unscaled(uint32_t pixels, float scale) {
@@ -2942,7 +2960,13 @@ index 6739e5d..c20a4ce 100644
      VkImageView view = VK_NULL_HANDLE; // all levels and layers, identity swizzle
      VkFormat format = VK_FORMAT_UNDEFINED;
      VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-@@ -99,6 +101,8 @@ struct Target {
+@@ -96,9 +98,14 @@ struct Target {
+     // start of the frame, and the next frame gets the real frame's.
+     uint64_t written_frame = 0; // frame_number_ of the last write by a real frame
+     bool carried = false;       // read before written in this frame
++    // port/patch_target_evict_layers.py: one layer of an array/cube/3D texture (or thick-tiled): its write-back alone
++    // does not give the texture back, so it is not freed for being written back.
++    bool layered = false;
      bool start_copied = false;  // start_copy holds this frame's start
      bool rewrites = false;      // was rewritten after being carried before: copy its start
      Image start_copy, end_copy;
@@ -2951,7 +2975,7 @@ index 6739e5d..c20a4ce 100644
  };
  
  struct Texture {
-@@ -110,6 +114,7 @@ struct Texture {
+@@ -110,6 +117,7 @@ struct Texture {
      uint64_t hash = 0;       // of the guest data last loaded
      bool dirty = true;       // the CPU wrote its memory since it was loaded
      uint64_t used_frame = 0; // frame_number_ of the last draw that bound it (evict_textures)
@@ -2959,7 +2983,7 @@ index 6739e5d..c20a4ce 100644
      const Target* source = nullptr; // render target the contents came from
      float scale = 1;        // image size over the resource's size (copied from upscaled targets)
      // A replacement (gpu/replacements.h) matched the contents: its index,
-@@ -118,6 +123,15 @@ struct Texture {
+@@ -118,6 +126,15 @@ struct Texture {
      int replacement = -1;
      uint64_t replacement_generation = 0;
      bool rgba = false;
@@ -2975,7 +2999,7 @@ index 6739e5d..c20a4ce 100644
  };
  
  struct ShaderModule {
-@@ -181,6 +195,7 @@ public:
+@@ -181,6 +198,7 @@ public:
      void swap() override;
      void invalidate(uint32_t address, uint32_t size, uint32_t coherency_flags) override;
      void cpu_wrote(uint32_t address, uint32_t size) override;
@@ -2983,7 +3007,7 @@ index 6739e5d..c20a4ce 100644
      void sync() override;
      uint64_t flush() override;
      void wait_for(uint64_t value) override;
-@@ -205,6 +220,26 @@ private:
+@@ -205,6 +223,26 @@ private:
      uint64_t waits_by_[4] = {}, submits_counted_ = 0;
      bool flush_pending_ = false; // flush() held back a submission (see Renderer::flush)
      double last_submit_ = 0;
@@ -3010,7 +3034,7 @@ index 6739e5d..c20a4ce 100644
      void barrier();
      uint8_t* upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset);
      // `shared`: used by the presentation queue too (concurrent sharing).
-@@ -244,20 +279,50 @@ private:
+@@ -244,20 +282,50 @@ private:
          uint64_t value;     // submission that copies it to staging
          uint32_t staging;   // index in write_back_staging_
          uint32_t address, base_reg, tile_mode, bpp, pitch, height;
@@ -3062,7 +3086,7 @@ index 6739e5d..c20a4ce 100644
      VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
      Buffer depth_staging_; // video memory for depth -> texture copies
      // A 1x1 2D image of zeros, for texture slots with nothing bound.
-@@ -268,10 +333,15 @@ private:
+@@ -268,10 +336,15 @@ private:
      const ShaderModule* shader(latte::Stage stage, uint32_t address, uint32_t size, uint32_t fetch_address,
                                 uint32_t fetch_size, const latte::ShaderEnvironment& env);
      const latte::Program* program(uint32_t address, uint32_t size, uint64_t& hash);
@@ -3080,7 +3104,7 @@ index 6739e5d..c20a4ce 100644
      latte::abi::Buffer buffer_descriptor(uint32_t address, uint32_t size, uint32_t stride) const;
  
      // ---------------------------------------- interpolation (interpolate.cpp)
-@@ -339,6 +409,10 @@ private:
+@@ -339,6 +412,10 @@ private:
      void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
      void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
      uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
@@ -3091,7 +3115,7 @@ index 6739e5d..c20a4ce 100644
      bool uncapped_ = false;         // as many of those as the GPU keeps up with, presented without pacing or vsync
      bool replaying_ = false;
      bool replayed_ = false; // this frame's extra frames were rendered
-@@ -468,14 +542,22 @@ private:
+@@ -468,14 +545,22 @@ private:
      // Shaders and pipelines of earlier runs, compiled before the title starts.
      void precompile();
      VkShaderModule cached_module(uint64_t glsl_hash, const std::vector<uint32_t>* spirv);
@@ -3115,7 +3139,7 @@ index 6739e5d..c20a4ce 100644
      void save_sequence_image(uint32_t n);
  
      float scale_ = 1; // upscaling factor of screen-sized targets: 1, 1.5, 2, 3 or 4
-@@ -513,10 +595,21 @@ private:
+@@ -513,10 +598,21 @@ private:
      const Pipeline* bound_pipeline_ = nullptr;
  
      std::vector<std::unique_ptr<Target>> targets_;
@@ -3137,7 +3161,7 @@ index 6739e5d..c20a4ce 100644
      // Textures and shader programs by the 64 KiB pages of guest memory they
      // use, for the CPU-write and cache-invalidation notices (hundreds a frame).
      std::unordered_map<uint32_t, std::vector<Texture*>> texture_pages_;
-@@ -576,7 +669,10 @@ private:
+@@ -576,7 +672,10 @@ private:
      std::vector<VkSemaphore> rendered_;
  
      // TTT2_TRACE_FRAME=n: log every command of frame n (counted from 0).
@@ -3150,7 +3174,7 @@ index 6739e5d..c20a4ce 100644
      uint64_t trace_frame_ = UINT64_MAX;
  
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..f6b0907 100644
+index 5bd50e6..82b30ba 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
 @@ -10,7 +10,13 @@
@@ -3213,7 +3237,15 @@ index 5bd50e6..f6b0907 100644
      auto t = std::make_unique<Target>();
      t->address = address;
      t->format = format;
-@@ -103,16 +119,71 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -96,6 +112,7 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+     // shortcut: widened targets (signed 10_10_10_2) are not written back; pack them back to 10 bits if a title reads one.
+     t->write_back = !f.widened && t->scale == 1 && uint64_t{pitch} * height * f.bytes <= kWriteBackBytes && same(f.swizzle.r) &&
+                     same(f.swizzle.g) && same(f.swizzle.b) && same(f.swizzle.a);
++    t->layered = tile_mode == 3 || tile_mode == 7 || tile_mode == 11 || tile_mode == 13 || tile_mode == 15; // port/patch_target_evict_layers.py
+     const uint32_t width = scaled(pitch, t->scale), rows = scaled(height, t->scale);
+     t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, width, rows, 1, 1,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+@@ -103,16 +120,72 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
                              VK_IMAGE_VIEW_TYPE_2D);
      t->written = stamp();
      t->written_frame = frame_number_;
@@ -3282,11 +3314,12 @@ index 5bd50e6..f6b0907 100644
 +    }
 +    Target* t = color_target(base, buffer.cb_color_size, buffer.cb_color_info);
 +    if (sliced && t != nullptr) t->write_back = false; // its key is not its place in guest memory
++    if (sliced && t != nullptr) t->layered = true; // port/patch_target_evict_layers.py
 +    return t;
  }
  
  Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t info_reg) {
-@@ -121,9 +192,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -121,9 +194,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
      const uint32_t format = depth_buffer_surface_format(info_reg);
      const uint32_t pitch = ((size_reg & 0x3FF) + 1) * 8;
      const uint32_t height = (((size_reg >> 10) & 0xFFFFF) + 1) * 64 / pitch;
@@ -3302,7 +3335,7 @@ index 5bd50e6..f6b0907 100644
          }
      }
      const FormatInfo f = depth_format(format);
-@@ -150,6 +224,11 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -150,6 +226,11 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
                              VK_IMAGE_VIEW_TYPE_2D);
      t->written = stamp();
      t->written_frame = frame_number_;
@@ -3314,7 +3347,7 @@ index 5bd50e6..f6b0907 100644
      targets_.push_back(std::move(t));
      return targets_.back().get();
  }
-@@ -181,8 +260,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -181,8 +262,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -3330,7 +3363,7 @@ index 5bd50e6..f6b0907 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
-@@ -194,11 +278,15 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -194,11 +280,15 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      t.start_copied = false;
      t.scale = scale;
      t.written = stamp();
@@ -3348,7 +3381,7 @@ index 5bd50e6..f6b0907 100644
  }
  
  // ----------------------------------------------------------------- clears
-@@ -245,6 +333,45 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+@@ -245,6 +335,45 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
      profile_mark("clear depth", t->address, t->image.width, t->image.height);
      t->written = stamp();
      note_target_written(t);
@@ -3394,7 +3427,7 @@ index 5bd50e6..f6b0907 100644
      if (tracing()) {
          std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                       t->pitch, t->height, flags, depth, stencil);
-@@ -420,9 +547,33 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+@@ -420,9 +549,33 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
  // ------------------------------------------------------------ write-back
  
  void Renderer::queue_write_back(Target* t) {
@@ -3428,7 +3461,7 @@ index 5bd50e6..f6b0907 100644
  }
  
  // At the end of a submission: the targets it wrote, copied to staging memory.
-@@ -435,12 +586,28 @@ void Renderer::copy_write_backs() {
+@@ -435,12 +588,28 @@ void Renderer::copy_write_backs() {
      for (Target* t : write_back_targets_) {
          t->write_back_queued = false;
          const uint32_t bytes = color_format(t->format).bytes;
@@ -3460,7 +3493,7 @@ index 5bd50e6..f6b0907 100644
          }
          const uint32_t staging = write_back_free_.back();
          write_back_free_.pop_back();
-@@ -449,13 +616,40 @@ void Renderer::copy_write_backs() {
+@@ -449,13 +618,40 @@ void Renderer::copy_write_backs() {
          region.imageExtent = {t->pitch, t->height, 1};
          vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
                                 &region);
@@ -3502,7 +3535,7 @@ index 5bd50e6..f6b0907 100644
      // For the host, and before the next submission's commands: its first
      // draw may render into a target these copies read.
      VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-@@ -472,6 +666,19 @@ void Renderer::copy_write_backs() {
+@@ -472,6 +668,19 @@ void Renderer::copy_write_backs() {
  // (Retirement thread.) The copies of the submissions up to `value`, tiled
  // into guest memory.
  void Renderer::retired(uint64_t value) {
@@ -3522,7 +3555,7 @@ index 5bd50e6..f6b0907 100644
      for (;;) {
          WriteBack w;
          const uint8_t* data;
-@@ -482,6 +689,39 @@ void Renderer::retired(uint64_t value) {
+@@ -482,6 +691,39 @@ void Renderer::retired(uint64_t value) {
              write_backs_.pop_front();
              data = write_back_staging_[w.staging].mapped;
          }
@@ -3562,7 +3595,7 @@ index 5bd50e6..f6b0907 100644
          TiledLevel level{};
          level.data = guest_pointer(w.address);
          level.base256b = w.base_reg;
-@@ -492,8 +732,124 @@ void Renderer::retired(uint64_t value) {
+@@ -492,8 +734,138 @@ void Renderer::retired(uint64_t value) {
          level.slices = 1;
          level.samples = 1;
          tile(level, w.pitch, w.height, 0, 1, data);
@@ -3587,7 +3620,8 @@ index 5bd50e6..f6b0907 100644
 +// Nothing is lost when the target goes: its memory holds newer data, or its own (written back).
 +bool Renderer::target_dispensable(const Target& t) const {
 +    if (t.overwritten > t.written) return true; // the CPU wrote its memory since: textures read that memory anyway
-+    if (t.write_back && std::getenv("TTT2_NO_WRITEBACK") == nullptr && std::getenv("TTT2_WRITEBACK_RANGE") == nullptr) {
++    // port/patch_target_evict_layers.py: not a layer of a layered texture (its other layers are not in guest memory)
++    if (t.write_back && !t.layered && std::getenv("TTT2_NO_WRITEBACK") == nullptr && std::getenv("TTT2_WRITEBACK_RANGE") == nullptr) {
 +        return true; // every GPU write of it was tiled into guest memory
 +    }
 +    // A newer target over (part of) its memory: on the console the GPU wrote over it there.
@@ -3651,9 +3685,22 @@ index 5bd50e6..f6b0907 100644
 +            continue;
 +        }
 +        if (std::getenv("TTT2_TRACE_TARGETS")) {
-+            std::fprintf(stderr, "ttt2: gpu: freed %s target 0x%08X fmt 0x%03X %ux%u (unused for %llu frames)\n",
-+                         t->depth ? "depth" : "color", t->address, t->format, t->pitch, t->height,
-+                         static_cast<unsigned long long>(frame_number_ - t->used_frame));
++            // port/patch_target_evict_layers.py: why it may go, and the newer target over it
++            const char* why = t->overwritten > t->written ? "cpu" : t->write_back && !t->layered ? "writeback" : "overlap";
++            const Target* over = nullptr;
++            if (*why == 'o') {
++                const uint32_t from = t->address > max_target_span_ ? t->address - max_target_span_ : 0;
++                for (auto it = targets_sorted_.lower_bound(from); it != targets_sorted_.end() && it->first < t->end; ++it) {
++                    for (const Target* u : it->second) {
++                        if (u != t && u->end > t->address && u->address < t->end && u->written > t->written) over = u;
++                    }
++                }
++            }
++            std::fprintf(stderr, "ttt2: gpu: freed %s target 0x%08X fmt 0x%03X %ux%u tile %u%s (unused for %llu frames): %s",
++                         t->depth ? "depth" : "color", t->address, t->format, t->pitch, t->height, t->tile_mode,
++                         t->layered ? " layered" : "", static_cast<unsigned long long>(frame_number_ - t->used_frame), why);
++            if (over) std::fprintf(stderr, " under 0x%08X fmt 0x%03X %ux%u", over->address, over->format, over->pitch, over->height);
++            std::fprintf(stderr, "\n");
 +        }
 +        const auto drop = [&](auto& index) {
 +            const auto it = index.find(t->address);
@@ -3688,10 +3735,10 @@ index 5bd50e6..f6b0907 100644
  }
  
 diff --git a/runtime/src/gpu/vulkan/textures.cpp b/runtime/src/gpu/vulkan/textures.cpp
-index f5d0d7b..6c095cb 100644
+index f5d0d7b..0fb11dc 100644
 --- a/runtime/src/gpu/vulkan/textures.cpp
 +++ b/runtime/src/gpu/vulkan/textures.cpp
-@@ -12,6 +12,7 @@
+@@ -12,11 +12,13 @@
  #include "gpu/latte.h"
  #include "gpu/replacements.h"
  #include "gpu/tiling.h"
@@ -3699,7 +3746,13 @@ index f5d0d7b..6c095cb 100644
  #include "gx2/internal.h"
  
  #include "cafe/runtime.h"
-@@ -109,6 +110,15 @@ gx2::Surface surface_of(const Resource& r) {
+ 
+ #include <algorithm>
++#include <chrono> // port/patch_dump_tex_at.py
+ #include <array>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -109,6 +111,15 @@ gx2::Surface surface_of(const Resource& r) {
      return s;
  }
  
@@ -3715,7 +3768,7 @@ index f5d0d7b..6c095cb 100644
  VkComponentSwizzle component(const FormatInfo& f, uint32_t sel) {
      static constexpr VkComponentSwizzle kRgba[] = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
                                                     VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
-@@ -144,6 +154,7 @@ Texture* Renderer::texture(const uint32_t words[7]) {
+@@ -144,6 +155,7 @@ Texture* Renderer::texture(const uint32_t words[7]) {
              return nullptr;
          }
          auto t = std::make_unique<Texture>();
@@ -3723,7 +3776,7 @@ index f5d0d7b..6c095cb 100644
          std::copy(words, words + 7, t->words.begin());
          create_texture_image(*t, 1);
          const gx2::Surface s = surface_of(r);
-@@ -153,6 +164,7 @@ Texture* Renderer::texture(const uint32_t words[7]) {
+@@ -153,11 +165,45 @@ Texture* Renderer::texture(const uint32_t words[7]) {
          t->memory[1][1] = s.mip_levels > 1 ? uint32_t{s.mipmaps} + s.mipmap_size : uint32_t{s.mipmaps};
          for (const auto& range : t->memory) {
              if (range[1] > range[0]) for_pages(range[0], range[1], [&](uint32_t page) { texture_pages_[page].push_back(t.get()); });
@@ -3731,7 +3784,45 @@ index f5d0d7b..6c095cb 100644
          }
          entry = std::move(t);
      }
-@@ -172,13 +184,22 @@ void Renderer::create_texture_image(Texture& t, float scale) {
+     entry->used_frame = frame_number_;
+     load_texture(*entry);
++    { // port/patch_dump_tex_at.py: TTT2_DUMP_TEX_AT=<seconds>,<address hex>[,<count>]
++        static const char* spec = std::getenv("TTT2_DUMP_TEX_AT");
++        static const char* dir = std::getenv("TTT2_CAPTURE");
++        if (spec && dir) {
++            static const double at = std::atof(spec);
++            static const uint32_t address = [] {
++                const char* c = std::strchr(spec, ',');
++                return c ? static_cast<uint32_t>(std::strtoul(c + 1, nullptr, 16)) : 0u;
++            }();
++            static int left = [] {
++                const char* c = std::strchr(spec, ',');
++                c = c ? std::strchr(c + 1, ',') : nullptr;
++                return c ? std::atoi(c + 1) : 1;
++            }();
++            static const auto start = std::chrono::steady_clock::now();
++            if (left > 0 && (words[2] << 8) == address &&
++                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at) {
++                static int n = 0;
++                --left;
++                end_rendering();
++                const Image& img = entry->image;
++                std::fprintf(stderr, "dumptex: %d 0x%08X %ux%u layers %u levels %u vk format %d source %p (frame %llu)\n", n,
++                             address, img.width, img.height, img.layers, img.levels, static_cast<int>(img.format),
++                             static_cast<const void*>(entry->source), static_cast<unsigned long long>(frame_number_));
++                for (uint32_t layer = 0; layer < img.layers; ++layer) {
++                    char nm[64];
++                    std::snprintf(nm, sizeof(nm), "/dumptex_%d_L%02u.png", n, layer);
++                    save_image_layer(img, layer, 0, std::string(dir) + nm);
++                }
++                ++n;
++            }
++        }
++    }
+     return entry.get();
+ }
+ 
+@@ -172,13 +218,22 @@ void Renderer::create_texture_image(Texture& t, float scale) {
      const FormatInfo f = color_format(t.rgba ? fmt::k8_8_8_8 : r.format);
      t.scale = scale;
      const uint32_t layers = r.depth;
@@ -3756,7 +3847,7 @@ index f5d0d7b..6c095cb 100644
      vci.format = f.format;
      vci.components = {component(f, r.sel[0]), component(f, r.sel[1]), component(f, r.sel[2]), component(f, r.sel[3])};
      const uint32_t base_level = std::min(r.base_level, r.last_level);
-@@ -188,6 +209,9 @@ void Renderer::create_texture_image(Texture& t, float scale) {
+@@ -188,6 +243,9 @@ void Renderer::create_texture_image(Texture& t, float scale) {
      if (vci.viewType == VK_IMAGE_VIEW_TYPE_CUBE) {
          first = 0;
          count = 6;
@@ -3766,7 +3857,7 @@ index f5d0d7b..6c095cb 100644
      } else if (vci.viewType == VK_IMAGE_VIEW_TYPE_2D || vci.viewType == VK_IMAGE_VIEW_TYPE_1D ||
                 vci.viewType == VK_IMAGE_VIEW_TYPE_3D) {
          count = 1;
-@@ -196,10 +220,13 @@ void Renderer::create_texture_image(Texture& t, float scale) {
+@@ -196,10 +254,13 @@ void Renderer::create_texture_image(Texture& t, float scale) {
      VK_CHECK(vkCreateImageView(ctx_.device, &vci, nullptr, &t.view));
  }
  
@@ -3782,7 +3873,7 @@ index f5d0d7b..6c095cb 100644
      width = std::min({scaled(width, src.scale), src.image.width, t.image.width});
      height = std::min({scaled(height, src.scale), src.image.height, t.image.height});
      // Through a buffer in video memory: depth and colour images do not
-@@ -222,6 +249,7 @@ void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t wid
+@@ -222,6 +283,7 @@ void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t wid
      vkCmdCopyImageToBuffer(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, depth_staging_.buffer, 1, &region);
      barrier();
      region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3790,7 +3881,7 @@ index f5d0d7b..6c095cb 100644
      vkCmdCopyBufferToImage(cmd(), depth_staging_.buffer, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
      barrier();
      profile_mark("depth to texture", src.address, width, height);
-@@ -245,7 +273,7 @@ static void report_target_texture_once(uint32_t format, float scale) {
+@@ -245,7 +307,7 @@ static void report_target_texture_once(uint32_t format, float scale) {
  bool Renderer::load_texture_from_targets(Texture& t) {
      const Resource r = decode(t.words.data());
      const FormatInfo f = color_format(r.format);
@@ -3799,7 +3890,7 @@ index f5d0d7b..6c095cb 100644
      const uint32_t levels = std::min(r.last_level + 1, 14u);
      const Target* sources[14] = {};
      uint64_t newest = 0;
-@@ -273,6 +301,54 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+@@ -273,6 +335,58 @@ bool Renderer::load_texture_from_targets(Texture& t) {
          note_target_read(src);
          newest = std::max(newest, src->written);
      }
@@ -3808,6 +3899,9 @@ index f5d0d7b..6c095cb 100644
 +    // port/patch_compressed_slices.py: compressed textures too (the slice targets hold their blocks as texels)
 +    const uint32_t slice_count = r.depth > 1 && slice_targets_enabled() ? std::min(r.depth, 64u) : 0;
 +    if (slice_count > 1) {
++        for (uint32_t level = 0; level < levels; ++level) { // port/patch_target_evict_layers.py
++            if (sources[level]) const_cast<Target*>(sources[level])->layered = true;
++        }
 +        const size_t cells = size_t{levels} * slice_count;
 +        if (t.slice_stride != slice_count || t.slice_keys.size() != cells) {
 +            t.slice_stride = slice_count;
@@ -3844,6 +3938,7 @@ index f5d0d7b..6c095cb 100644
 +                    continue;
 +                }
 +                t.slice_found[size_t{level} * slice_count + z] = src;
++                const_cast<Target*>(src)->layered = true; // port/patch_target_evict_layers.py
 +                const_cast<Target*>(src)->used_frame = frame_number_; // port/patch_target_eviction.py
 +                note_target_read(src);
 +                newest = std::max(newest, src->written);
@@ -3854,7 +3949,7 @@ index f5d0d7b..6c095cb 100644
      if (t.source == sources[0] && t.loaded >= newest && t.scale == sources[0]->scale) return true;
      // An upscaled target gives an upscaled texture; levels of another scale
      // than level 0 are left out.
-@@ -303,6 +379,26 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+@@ -303,6 +417,26 @@ bool Renderer::load_texture_from_targets(Texture& t) {
          vkCmdCopyImage(cmd(), src->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
                         &region);
      }
@@ -3881,7 +3976,7 @@ index f5d0d7b..6c095cb 100644
      barrier();
      profile_mark("texture from target", sources[0]->address, scaled(r.width, scale), scaled(r.height, scale));
      t.source = sources[0];
-@@ -328,8 +424,37 @@ void Renderer::load_texture(Texture& t) {
+@@ -328,8 +462,39 @@ void Renderer::load_texture(Texture& t) {
                               r.format, src->format);
                  return;
              }
@@ -3909,6 +4004,8 @@ index f5d0d7b..6c095cb 100644
 +                if (other == nullptr) continue;
 +                if (static const bool watch = std::getenv("TTT2_SEQ_PS") != nullptr; watch) seq_watch(other->address); // port/patch_seq_ps.py
 +                slices[z] = other;
++                const_cast<Target*>(other)->layered = true; // port/patch_target_evict_layers.py
++                const_cast<Target*>(src)->layered = true;
 +                const_cast<Target*>(other)->used_frame = frame_number_; // port/patch_target_eviction.py
 +                newest = std::max(newest, other->written);
 +            }
@@ -3920,7 +4017,7 @@ index f5d0d7b..6c095cb 100644
                  t.source = src;
                  t.loaded = stamp();
                  t.dirty = false;
-@@ -348,7 +473,7 @@ void Renderer::load_texture(Texture& t) {
+@@ -348,7 +513,7 @@ void Renderer::load_texture(Texture& t) {
      // A replay renders the frame's data again: what the CPU wrote since is the next frame's.
      if (replaying_ && t.loaded != 0) return;
  
@@ -3929,7 +4026,7 @@ index f5d0d7b..6c095cb 100644
      if (!guest_memory_committed(s.image, s.image_size) ||
          (s.mip_levels > 1 && !guest_memory_committed(s.mipmaps, s.mipmap_size))) {
          t.dirty = false;
-@@ -364,6 +489,10 @@ void Renderer::load_texture(Texture& t) {
+@@ -364,6 +529,10 @@ void Renderer::load_texture(Texture& t) {
      if (s.mip_levels > 1) h ^= hash_bytes(guest_pointer(s.mipmaps), s.mipmap_size) * 31;
      t.dirty = false;
      if (h == t.hash && t.source == nullptr && t.loaded != 0 && t.scale == 1) return;
@@ -3940,7 +4037,7 @@ index f5d0d7b..6c095cb 100644
      if (t.scale != 1) create_texture_image(t, 1);
      t.hash = h;
      t.source = nullptr;
-@@ -570,15 +699,35 @@ void Renderer::evict_textures() {
+@@ -570,15 +739,35 @@ void Renderer::evict_textures() {
          return true;
      });
      constexpr uint64_t kUnusedFrames = 600;
@@ -3977,7 +4074,7 @@ index f5d0d7b..6c095cb 100644
              for_pages(range[0], range[1], [&](uint32_t page) {
                  const auto p = texture_pages_.find(page);
                  if (p == texture_pages_.end()) return;
-@@ -627,10 +776,22 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
+@@ -627,10 +816,22 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
      if (size == 0 || !(coherency_flags & (1u << 23))) return;
      // Titles flush the whole cache every frame; CPU writes come through
      // cpu_wrote(), so only a ranged invalidation suggests changed data.
@@ -4001,7 +4098,7 @@ index f5d0d7b..6c095cb 100644
  void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
      if (frames_per_frame_ > 1) forget_snapshots(address, size);
      const uint64_t end = uint64_t{address} + size;
-@@ -648,8 +809,11 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
+@@ -648,8 +849,11 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
      // (A flush of everything says nothing about render targets.)
      if (size < 0x10000000) {
          uint64_t now = 0;

@@ -66,7 +66,7 @@ own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system lang
 
 **Getestet / tested (23 Nov 2026):** `setup-windows.ps1` in an empty folder on Windows 11 (i7-13700KF, RTX 3070 Ti, 8 jobs, `-SysDir` with the tester's own Mii files): video module translated and loaded, the whole build took about 3 minutes; `Start.bat`'s program went from the title through the menus into a race at Mario Kart Stadium (57-58 frames/s with picture captures on). The translation is the same as the console build's (only the newer recompiler's `dcbf` lines differ). The same scripts were run end to end from an empty folder on 23 November 2026: Lost Levels and Mario Kart 8 on Windows 11, Lost Levels on Ubuntu 26.04 and on a fresh Ubuntu 24.04 (SDL3 built from source there), Mario Party 10 on Windows 11.
 
-## Status (24 November 2026): races run at 59-60 frames/s on a Batocera console with the graphics fixes, menu videos play
+## Status (25 November 2026): races run at 59-60 frames/s on a Batocera console, menu videos play also after a cup
 
 | Step | State |
 | --- | --- |
@@ -111,6 +111,20 @@ the game and **not** included here: point `CAFE_SYS_DIR` at a Cemu-style `mlc01/
   the program's own memory 0.40 -> 0.61 GB (before: 0.34 -> 2.12 GB, 50 MB a minute); flat while racing, small steps
   when a new track loads. Speed unchanged: race 59.8 frames/s, slowest 10 s 58.1, longest frame 47 ms; track
   loading frames 190-310 ms (old program at the second track: 1.6 s).
+
+## 25 November 2026: freed render targets no longer take layered textures with them
+
+- Players saw on the console: menu preview videos almost black after a cup, Mario black on the character turntable,
+  dark coins. Cause (measured): the render-target eviction of 24 November also freed layer 0 of cube, array and 3D
+  textures "because it is written back to guest memory"; their other layers are never written back, so the texture
+  came back from memory as garbage (the menu's colour-grading table, the menu's lighting cube, reflection data).
+  Now such layered targets are only freed when the CPU or a newer target really overwrote their memory
+  (`patch_target_evict_layers.py`; `TTT2_TRACE_TARGETS=1` prints why each target goes). Memory stays flat
+  (39 minutes of Grand Prix on the console: GPU memory 3.0-3.2 GB, race 59.7 frames/s, as before).
+- Tools: `patch_dump_tex_at.py` (`TTT2_DUMP_TEX_AT=<s>,<address>`: one texture's layers as PNG without a frame
+  trace), `patch_stall_ms.py` (`TTT2_STALL_MS`: threshold of `TTT2_TRACE_STALLS`).
+- Still open: in the rear view on Thwomp Ruins a large black wedge can appear (drawn by the blob-shadow pass; cause
+  not found yet); single 30 ms frames every few seconds come from the game side finishing a frame late.
 
 ## What it took
 
