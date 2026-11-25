@@ -1580,7 +1580,7 @@ index 8397b1f..6675300 100644
          VkFormatProperties p;
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..675d142 100644
+index d591259..a5c6eb2 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -2142,7 +2142,107 @@ index d591259..675d142 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1464,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1077,6 +1355,99 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         else barrier();
+     }
+ 
++    { // port/patch_race_check.py: TTT2_RACE_CHECK=<ps hash>
++        static const char* spec = std::getenv("TTT2_RACE_CHECK");
++        if (spec != nullptr) {
++            struct Part { const char* what; uint32_t address, size, offset; };
++            struct Pending { uint64_t value = 0, frame = 0; std::vector<Part> parts; std::vector<uint8_t> cpu; bool used = false; };
++            static constexpr uint32_t kSlots = 8, kSlotBytes = 128u << 10;
++            static Buffer readback{};
++            static Pending pending[kSlots];
++            static uint32_t next = 0;
++            static uint64_t checked = 0, raced = 0;
++            static const uint64_t want = std::strtoull(spec, nullptr, 16);
++            if (readback.buffer == VK_NULL_HANDLE) {
++                readback = ctx_.create_buffer(VkDeviceSize{kSlots} * kSlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++            }
++            uint64_t done = 0;
++            vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done);
++            for (uint32_t s = 0; s < kSlots; ++s) { // finished checks
++                Pending& p = pending[s];
++                if (!p.used || p.value > done) continue;
++                p.used = false;
++                ++checked;
++                bool any = false;
++                for (const Part& part : p.parts) {
++                    const uint8_t* gpu = readback.mapped + VkDeviceSize{s} * kSlotBytes + part.offset;
++                    const uint8_t* cpu = p.cpu.data() + part.offset;
++                    uint32_t n = 0, first = UINT32_MAX;
++                    for (uint32_t i = 0; i < part.size; ++i) {
++                        if (gpu[i] != cpu[i]) { ++n; first = std::min(first, i); }
++                    }
++                    if (n == 0) continue;
++                    any = true;
++                    std::fprintf(stderr, "race: frame %llu %s 0x%08X: %u of %u bytes changed (first at byte %u)\n",
++                                 static_cast<unsigned long long>(p.frame), part.what, part.address, n, part.size, first);
++                }
++                if (any) ++raced;
++                if (checked % 600 == 0) {
++                    std::fprintf(stderr, "race: %llu of %llu draws read guest data the CPU had changed since the draw was recorded\n",
++                                 static_cast<unsigned long long>(raced), static_cast<unsigned long long>(checked));
++                }
++            }
++            uint64_t ph = 0;
++            program(r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, ph);
++            Pending& p = pending[next];
++            if (ph == want && !p.used) {
++                next = (next + 1) % kSlots;
++                p.parts.clear();
++                p.cpu.clear();
++                static const char* const vb_names[4] = {"vb0", "vb1", "vb2", "vb3"};
++                static const char* const cb_names[2][16] = {
++                    {"vs kc0", "vs kc1", "vs kc2", "vs kc3", "vs kc4", "vs kc5", "vs kc6", "vs kc7", "vs kc8", "vs kc9", "vs kc10", "vs kc11", "vs kc12", "vs kc13", "vs kc14", "vs kc15"},
++                    {"ps kc0", "ps kc1", "ps kc2", "ps kc3", "ps kc4", "ps kc5", "ps kc6", "ps kc7", "ps kc8", "ps kc9", "ps kc10", "ps kc11", "ps kc12", "ps kc13", "ps kc14", "ps kc15"}};
++                uint32_t used = 0;
++                const auto add = [&](const char* what, uint32_t address, uint32_t size) {
++                    size = (std::min(size, kSlotBytes - used)) & ~3u;
++                    if (address == 0 || size == 0 || !guest_memory_committed(address, size)) return;
++                    p.parts.push_back({what, address, size, used});
++                    p.cpu.resize(used + size);
++                    std::memcpy(p.cpu.data() + used, guest_pointer(address), size);
++                    used += (size + 15) & ~15u;
++                };
++                for (uint32_t i = 0; i < 4; ++i) {
++                    const uint32_t base = kResourceBase + (resource::kVsAttrib + i) * resource::kWords * 4;
++                    if ((r(base + 24) >> 30) != (resource::kTypeValidBuffer >> 30)) continue;
++                    add(vb_names[i], r(base), std::min(r(base + 4) + 1, 16u << 10));
++                }
++                for (int stage = 0; stage < 2; ++stage) {
++                    const ShaderModule* sm = stage == 0 ? vs : ps;
++                    for (uint32_t bank = 0; bank < 16; ++bank) {
++                        if (!((sm->info.constant_bank_mask >> bank) & 1)) continue;
++                        const uint32_t a = r((stage == 0 ? reg::SQ_ALU_CONST_CACHE_VS_0 : reg::SQ_ALU_CONST_CACHE_PS_0) + bank * 4) << 8;
++                        const uint32_t size = r((stage == 0 ? reg::SQ_ALU_CONST_BUFFER_SIZE_VS_0 : reg::SQ_ALU_CONST_BUFFER_SIZE_PS_0) + bank * 4) << 8;
++                        add(cb_names[stage][bank], a, std::min(size, 4096u));
++                    }
++                }
++                if (!p.parts.empty()) {
++                    end_rendering();
++                    for (const Part& part : p.parts) {
++                        VkBuffer gb = VK_NULL_HANDLE;
++                        VkDeviceSize go = 0;
++                        if (!guest_.locate(part.address, part.size, gb, go)) continue;
++                        VkBufferCopy bc{go, VkDeviceSize{next == 0 ? kSlots - 1 : next - 1} * kSlotBytes + part.offset, part.size};
++                        vkCmdCopyBuffer(cmd(), gb, readback.buffer, 1, &bc);
++                    }
++                    barrier();
++                    p.value = submitted_ + 1;
++                    p.frame = frame_number_;
++                    p.used = true;
++                }
++            }
++        }
++    }
+     // The rendering pass.
+     if (!rendering_ || pass_depth_ != depth ||
+         !std::equal(colors.begin(), colors.end(), pass_colors_.begin())) {
+@@ -1186,7 +1557,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -2166,7 +2266,7 @@ index d591259..675d142 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1209,7 +1502,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1209,7 +1595,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkCullModeFlags cull = 0;
      if (mode & 1) cull |= VK_CULL_MODE_FRONT_BIT;
      if (mode & 2) cull |= VK_CULL_MODE_BACK_BIT;
@@ -2176,7 +2276,7 @@ index d591259..675d142 100644
      // FACE: 0 counter-clockwise front, in the y-down window space Vulkan uses too.
      vkCmdSetFrontFace(c, (mode >> 2) & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
      vkCmdSetPrimitiveTopology(c, topology);
-@@ -1243,7 +1537,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1243,7 +1630,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          no_depth = range && count >= std::strtoul(range, nullptr, 10) &&
                     count <= std::strtoul(std::strchr(range, ',') + 1, nullptr, 10);
      }
@@ -2186,7 +2286,7 @@ index d591259..675d142 100644
      vkCmdSetDepthWriteEnable(c, has_depth && (((depth_control >> 2) & 1) || no_depth)); // (no_depth: shows its depth)
      // (no_depth: always passes, still writing depth.)
      vkCmdSetDepthCompareOp(c, no_depth ? VK_COMPARE_OP_ALWAYS : static_cast<VkCompareOp>((depth_control >> 4) & 7));
-@@ -1273,6 +1568,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1273,6 +1661,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 8) & 0xFF);
      vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 16) & 0xFF);
  
@@ -2207,7 +2307,7 @@ index d591259..675d142 100644
      if (tracing()) {
          uint64_t vh = 0, ph = 0, fh = 0;
          program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
-@@ -1285,6 +1594,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1687,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -2241,7 +2341,7 @@ index d591259..675d142 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1638,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1731,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -2267,7 +2367,7 @@ index d591259..675d142 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,10 +1668,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,10 +1761,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -2347,7 +2447,7 @@ index d591259..675d142 100644
          std::fprintf(stderr, "trace:   viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X\n", viewport.x,
                       viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x,
                       scissor.offset.y, scissor.extent.width, scissor.extent.height, mode & 7);
-@@ -1325,7 +1749,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,9 +1842,214 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -2355,8 +2455,215 @@ index d591259..675d142 100644
 +        vkCmdDraw(c, r(reg::VGT_PRIMITIVE_TYPE) == 0x11 ? d.count / 3 * 6 : d.count, instances, 0, 0);
      }
      if (writes_stream_out) stream_out_pending_ = true;
++    { // port/patch_pixel_writers.py: TTT2_PIXEL_WRITERS=<seconds>,<fx>,<fy>
++        static const char* spec = std::getenv("TTT2_PIXEL_WRITERS");
++        if (spec != nullptr) {
++            struct Rec { uint32_t draw; uint64_t vs, ps; uint32_t address, format, w, h; bool depth; };
++            static constexpr uint32_t kMax = 4096;
++            static Buffer rb{};
++            static std::vector<Rec> recs;
++            static uint64_t frame = UINT64_MAX;
++            static int state = 0; // 0 waiting, 1 recording, 2 done
++            static uint32_t n = 0;
++            static const double at = std::atof(spec);
++            static float fx = 0.5f, fy = 0.5f;
++            static const auto start = std::chrono::steady_clock::now();
++            if (state == 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at) {
++                const char* c = std::strchr(spec, ',');
++                if (c) { fx = std::strtof(c + 1, nullptr); c = std::strchr(c + 1, ','); }
++                if (c) fy = std::strtof(c + 1, nullptr);
++                rb = ctx_.create_buffer(VkDeviceSize{kMax} * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
++                std::memset(rb.mapped, 0, kMax * 16);
++                state = 1;
++                frame = frame_number_ + 1; // a whole frame: from the next one
++            }
++            if (state == 1 && frame_number_ > frame) { // the frame is over: read and print
++                submit(true);
++                state = 2;
++                std::map<std::pair<uint32_t, bool>, std::array<uint8_t, 16>> last;
++                std::fprintf(stderr, "pixel: frame %llu, %u draws, spot %.3f,%.3f\n", static_cast<unsigned long long>(frame), n,
++                             static_cast<double>(fx), static_cast<double>(fy));
++                for (uint32_t i = 0; i < recs.size(); ++i) {
++                    const Rec& rc = recs[i];
++                    std::array<uint8_t, 16> v{};
++                    std::memcpy(v.data(), rb.mapped + VkDeviceSize{i} * 16, 16);
++                    const auto key = std::make_pair(rc.address, rc.depth);
++                    const auto it = last.find(key);
++                    if (it != last.end() && it->second == v) continue;
++                    char before[40] = "?", after[40];
++                    if (rc.depth) {
++                        float f;
++                        std::memcpy(&f, v.data(), 4);
++                        std::snprintf(after, sizeof(after), "%.7f", static_cast<double>(f));
++                        if (it != last.end()) { std::memcpy(&f, it->second.data(), 4); std::snprintf(before, sizeof(before), "%.7f", static_cast<double>(f)); }
++                    } else {
++                        std::snprintf(after, sizeof(after), "%02x%02x%02x%02x %02x%02x%02x%02x", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++                        if (it != last.end()) {
++                            const auto& b = it->second;
++                            std::snprintf(before, sizeof(before), "%02x%02x%02x%02x %02x%02x%02x%02x", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++                        }
++                    }
++                    std::fprintf(stderr, "pixel: draw %u vs %016llx ps %016llx %s 0x%08X fmt 0x%03X %ux%u: %s -> %s\n", rc.draw,
++                                 static_cast<unsigned long long>(rc.vs), static_cast<unsigned long long>(rc.ps),
++                                 rc.depth ? "depth" : "color", rc.address, rc.format, rc.w, rc.h, before, after);
++                    last[key] = v;
++                }
++            }
++            if (state == 1 && frame_number_ == frame && recs.size() + 2 <= kMax) {
++                ++n;
++                uint64_t vh = 0, ph = 0;
++                program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
++                program(r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, ph);
++                end_rendering();
++                const auto copy = [&](const Target* t, bool is_depth) {
++                    if (t == nullptr || t->image.image == VK_NULL_HANDLE) return;
++                    const Image& img = t->image;
++                    VkBufferImageCopy rg{};
++                    rg.bufferOffset = VkDeviceSize{recs.size()} * 16;
++                    rg.imageSubresource = {is_depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : VkImageAspectFlags{VK_IMAGE_ASPECT_COLOR_BIT}, 0, 0, 1};
++                    rg.imageOffset = {static_cast<int32_t>(fx * img.width), static_cast<int32_t>(fy * img.height), 0};
++                    rg.imageExtent = {1, 1, 1};
++                    if (is_depth && img.format != VK_FORMAT_D32_SFLOAT && img.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
++                    vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rg);
++                    recs.push_back({n, vh, ph, t->address, t->format, img.width, img.height, is_depth});
++                };
++                copy(colors[0], false);
++                copy(depth, true);
++                barrier();
++            }
++        }
++    }
++    { // port/patch_dump_draw_at.py: TTT2_DUMP_DRAW_AT=<seconds>,<ps hash>[,<count>[,<every>]]
++        static const char* spec = std::getenv("TTT2_DUMP_DRAW_AT");
++        static const char* dir = std::getenv("TTT2_CAPTURE");
++        if (spec && dir) {
++            static const double at = std::atof(spec);
++            static uint64_t want = 0;
++            static int left = 1, every = 0, seen = 0, n = 0;
++            static const bool parsed = [] {
++                const char* c = std::strchr(spec, ',');
++                if (c) want = std::strtoull(c + 1, nullptr, 16);
++                c = c ? std::strchr(c + 1, ',') : nullptr;
++                if (c) left = std::atoi(c + 1);
++                c = c ? std::strchr(c + 1, ',') : nullptr;
++                if (c) every = std::max(1, std::atoi(c + 1));
++                return true;
++            }();
++            (void)parsed;
++            static const auto start = std::chrono::steady_clock::now();
++            static bool armed = false; // the clock first, the shader hash only once it is time
++            if (!armed) armed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= at;
++            uint64_t ph = 0;
++            if (armed && (left > 0 || every > 0)) program(r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, ph);
++            if (armed && ph == want && (left > 0 || (every > 0 && (++seen % every) == 0))) {
++                if (left > 0) --left;
++                const int k = n++;
++                std::fprintf(stderr, "dumpdraw: %d frame %llu prim 0x%X count %u%s inst %u index_count %u base_vertex %u start_instance %u\n",
++                             k, static_cast<unsigned long long>(frame_number_), r(reg::VGT_PRIMITIVE_TYPE), d.count,
++                             indexed ? " indexed" : "", instances, index_count, dc.base_vertex, dc.start_instance);
++                std::fprintf(stderr, "dumpdraw: %d viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X depth_control 0x%08X clip 0x%08X vte 0x%08X\n",
++                             k, viewport.x, viewport.y, viewport.width, viewport.height, viewport.minDepth,
++                             viewport.maxDepth, scissor.offset.x, scissor.offset.y, scissor.extent.width,
++                             scissor.extent.height, mode & 7, depth_control, r(reg::PA_CL_CLIP_CNTL), r(reg::PA_CL_VTE_CNTL));
++                if (indexed && index_count <= 4096) {
++                    const uint32_t* ix = reinterpret_cast<const uint32_t*>(ring_.mapped() + index_offset);
++                    std::string line;
++                    for (uint32_t i = 0; i < index_count; ++i) line += std::to_string(ix[i]) + " ";
++                    std::fprintf(stderr, "dumpdraw: %d indices %s\n", k, line.c_str());
++                }
++                const auto be_float = [&](uint32_t address) {
++                    uint32_t w = 0;
++                    if (guest_memory_committed(address, 4)) std::memcpy(&w, guest_pointer(address), 4);
++                    return std::bit_cast<float>(__builtin_bswap32(w));
++                };
++                for (uint32_t i = 0; i < 2; ++i) {
++                    const uint32_t base = kResourceBase + (resource::kVsAttrib + i) * resource::kWords * 4;
++                    const uint32_t va = r(base), size = r(base + 4) + 1, stride = (r(base + 8) >> 8) & 0x7FF;
++                    std::fprintf(stderr, "dumpdraw: %d vb%u 0x%08X size %u stride %u\n", k, i, va, size, stride);
++                    if (va == 0 || stride == 0) continue;
++                    const uint32_t rows = std::min<uint32_t>(size / stride, 64);
++                    for (uint32_t v = 0; v < rows; ++v) {
++                        std::string line;
++                        char num[32];
++                        for (uint32_t o = 0; o + 4 <= stride && o < 128; o += 4) {
++                            std::snprintf(num, sizeof(num), "%.9g ", static_cast<double>(be_float(va + v * stride + o)));
++                            line += num;
++                        }
++                        std::fprintf(stderr, "dumpdraw: %d vb%u[%u] %s\n", k, i, v, line.c_str());
++                    }
++                }
++                for (int stage = 0; stage < 2; ++stage) {
++                    const ShaderModule* sm = stage == 0 ? vs : ps;
++                    for (uint32_t bank = 0; bank < 16; ++bank) {
++                        if (!((sm->info.constant_bank_mask >> bank) & 1)) continue;
++                        const uint32_t a = r((stage == 0 ? reg::SQ_ALU_CONST_CACHE_VS_0 : reg::SQ_ALU_CONST_CACHE_PS_0) + bank * 4) << 8;
++                        if (a == 0 || !guest_memory_committed(a, 16 * 16)) continue;
++                        for (uint32_t i = 0; i < 16; ++i) {
++                            float f[4];
++                            for (int q = 0; q < 4; ++q) f[q] = std::bit_cast<float>(*reinterpret_cast<const uint32_t*>(guest_pointer(a + i * 16 + q * 4)));
++                            std::fprintf(stderr, "dumpdraw: %d %s kc(%u,%u) %.9g %.9g %.9g %.9g\n", k, stage == 0 ? "vs" : "ps",
++                                         bank, i, static_cast<double>(f[0]), static_cast<double>(f[1]),
++                                         static_cast<double>(f[2]), static_cast<double>(f[3]));
++                        }
++                    }
++                }
++                const auto raw = [&](const Image& img, const char* what, uint32_t address) {
++                    uint32_t texel = 0;
++                    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++                    switch (img.format) {
++                    case VK_FORMAT_R8_UNORM: texel = 1; break;
++                    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R8G8_UNORM: texel = 2; break;
++                    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
++                    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++                    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R16G16_SFLOAT: texel = 4; break;
++                    case VK_FORMAT_R16G16B16A16_SFLOAT: texel = 8; break;
++                    case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: texel = 4; aspect = VK_IMAGE_ASPECT_DEPTH_BIT; break;
++                    case VK_FORMAT_D16_UNORM: texel = 2; aspect = VK_IMAGE_ASPECT_DEPTH_BIT; break;
++                    default: break;
++                    }
++                    std::fprintf(stderr, "dumpdraw: %d %s 0x%08X %ux%u layers %u vk format %d%s\n", k, what, address, img.width,
++                                 img.height, img.layers, static_cast<int>(img.format), texel ? "" : " (not saved)");
++                    if (texel == 0 || img.image == VK_NULL_HANDLE) return;
++                    const VkDeviceSize bytes = VkDeviceSize{img.width} * img.height * texel * img.layers;
++                    VkDeviceSize off = 0;
++                    upload(bytes, 16, off);
++                    end_rendering();
++                    barrier();
++                    VkBufferImageCopy rg{};
++                    rg.bufferOffset = off;
++                    rg.imageSubresource = {aspect, 0, 0, img.layers};
++                    rg.imageExtent = {img.width, img.height, 1};
++                    vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, ring_.buffer(), 1, &rg);
++                    submit(true);
++                    char name[160];
++                    std::snprintf(name, sizeof(name), "/dumpdraw_%d_%s_%ux%u_f%d.raw", k, what, img.width, img.height,
++                                  static_cast<int>(img.format));
++                    if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb")) {
++                        std::fwrite(ring_.mapped() + off, 1, static_cast<size_t>(bytes), f);
++                        std::fclose(f);
++                    }
++                };
++                if (colors[0]) raw(colors[0]->image, "color0", colors[0]->address);
++                if (depth) raw(depth->image, "depth", depth->address);
++                for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
++                    if (!(ps->info.texture_mask & (1u << slot))) continue;
++                    uint32_t w[7];
++                    for (int i = 0; i < 7; ++i) w[i] = r(kResourceBase + ((resource::kPsTexture + slot) * resource::kWords + i) * 4);
++                    const Texture* t = texture(w);
++                    if (t == nullptr || (t->source == nullptr && t->image.layers == 1)) continue; // layered: all layers
++                    char what[16];
++                    std::snprintf(what, sizeof(what), "tex%u", slot);
++                    raw(t->image, what, w[2] << 8);
++                }
++            }
++        }
++    }
      // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
-@@ -1436,6 +1860,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     if (tracing()) {
+         static uint64_t frame = UINT64_MAX;
+@@ -1436,6 +2158,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  const uint32_t w = x1 - x0, h = y1 - y0, texel = 8, bytes = w * h * texel;
                  VkDeviceSize offset = 0;
                  upload(bytes, 16, offset);
