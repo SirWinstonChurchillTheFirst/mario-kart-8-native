@@ -1580,7 +1580,7 @@ index 8397b1f..6675300 100644
          VkFormatProperties p;
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..a5c6eb2 100644
+index d591259..ca27ae6 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -1591,7 +1591,37 @@ index d591259..a5c6eb2 100644
  
  #include "gpu/latte.h"
  #include "gx2/types.h"
-@@ -314,6 +315,9 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -310,10 +311,39 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+                       static_cast<unsigned long long>(key));
+         std::ofstream(std::filesystem::path(dir) / name) << entry->info.glsl;
+     }
++    { // port/patch_probe_shader.py: TTT2_PROBE_PS / TTT2_PROBE_VS=<hash>|<items split by ##, @text@code after a line>
++        static const char* probe_ps = std::getenv("TTT2_PROBE_PS");
++        static const char* probe_vs = std::getenv("TTT2_PROBE_VS");
++        const char* probe = stage == Stage::kVertex ? probe_vs : probe_ps;
++        const char* bar = probe ? std::strchr(probe, '|') : nullptr;
++        if (bar && std::strtoull(probe, nullptr, 16) == program_hash) {
++            std::string& g = entry->info.glsl;
++            const std::string spec = bar + 1;
++            for (size_t from = 0; from < spec.size();) {
++                size_t to = spec.find("##", from);
++                if (to == std::string::npos) to = spec.size();
++                const std::string item = spec.substr(from, to - from);
++                from = to + 2;
++                if (item.empty()) continue;
++                if (item[0] == '@') {
++                    const size_t at = item.find('@', 1);
++                    const size_t hit = at == std::string::npos ? std::string::npos : g.find(item.substr(1, at - 1));
++                    const size_t eol = hit == std::string::npos ? std::string::npos : g.find('\n', hit);
++                    if (eol != std::string::npos) g.insert(eol + 1, item.substr(at + 1) + "\n");
++                } else if (const size_t end = g.rfind('}'); end != std::string::npos) {
++                    g.insert(end, "    " + item + "\n");
++                }
++            }
++            std::fprintf(stderr, "ttt2: probe: %s %016llx gets: %s\n", kind, static_cast<unsigned long long>(program_hash), bar + 1);
++        }
++    }
+     // SPIR-V is cached on disk by the GLSL it came from, and modules are
      // shared by it (precompile() makes those of earlier runs).
      const uint64_t glsl_hash = fnv(entry->info.glsl.data(), entry->info.glsl.size());
      entry->glsl_hash = glsl_hash;
@@ -1601,7 +1631,7 @@ index d591259..a5c6eb2 100644
      if (auto it = modules_.find(glsl_hash); it != modules_.end()) {
          entry->module = it->second;
          return entry.get();
-@@ -323,7 +327,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -323,7 +353,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
          if (!pending_modules_.count(glsl_hash)) {
              auto pending = std::make_shared<PendingModule>();
              pending_modules_[glsl_hash] = pending;
@@ -1610,7 +1640,7 @@ index d591259..a5c6eb2 100644
                             program_hash] {
                  std::vector<uint32_t> code = load_cached_spirv(glsl_hash);
                  if (code.empty()) {
-@@ -368,7 +372,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -368,7 +398,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
          shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_zero);
          Timed timed{spent_compile_};
          shaderc_compilation_result_t result = shaderc_compile_into_spv(
@@ -1619,7 +1649,7 @@ index d591259..a5c6eb2 100644
              stage == Stage::kVertex ? shaderc_vertex_shader : shaderc_fragment_shader, kind, "main", options);
          shaderc_compile_options_release(options);
          if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
-@@ -389,6 +393,75 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -389,6 +419,75 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
      return entry.get();
  }
  
@@ -1695,7 +1725,7 @@ index d591259..a5c6eb2 100644
  // Takes `entry`'s module from a finished worker compile, if any.
  void Renderer::resolve_module(ShaderModule& entry) {
      if (auto it = modules_.find(entry.glsl_hash); it != modules_.end()) {
-@@ -457,13 +530,15 @@ VkShaderModule Renderer::cached_module(uint64_t glsl_hash, const std::vector<uin
+@@ -457,13 +556,15 @@ VkShaderModule Renderer::cached_module(uint64_t glsl_hash, const std::vector<uin
  // -------------------------------------------------------------- pipelines
  
  VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_textures, bool vs_registers,
@@ -1714,7 +1744,7 @@ index d591259..a5c6eb2 100644
      if (vs_registers) bindings.push_back({abi::kVsRegistersBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
      if (ps_registers) bindings.push_back({abi::kPsRegistersBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
      for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
-@@ -490,17 +565,22 @@ VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_tex
+@@ -490,17 +591,22 @@ VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_tex
  }
  
  const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs, const ShaderModule* ps,
@@ -1739,7 +1769,7 @@ index d591259..a5c6eb2 100644
      for (uint32_t i = 0; i < color_count; ++i) {
          k.colors[i] = colors[i];
          if (colors[i] == VK_FORMAT_UNDEFINED) continue;
-@@ -521,7 +601,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -521,7 +627,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      if (entry) {
          const Built state = entry->state.load();
          if (state == Built::kFailed) return nullptr;
@@ -1748,7 +1778,7 @@ index d591259..a5c6eb2 100644
              entry->listed = true;
              append_saved("pipelines.list", entry->key);
          }
-@@ -532,11 +612,11 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -532,11 +638,11 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      entry->ps = ps;
      entry->key = k;
      entry->layout = pipeline_layout(vs->info.texture_mask, ps->info.texture_mask, vs->info.uses_registers,
@@ -1763,7 +1793,7 @@ index d591259..a5c6eb2 100644
              ++new_pipelines_;
              p->state = p->pipeline != VK_NULL_HANDLE ? Built::kReady : Built::kFailed;
          });
-@@ -544,7 +624,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -544,7 +650,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      }
      {
          Timed timed{spent_pipeline_};
@@ -1772,7 +1802,7 @@ index d591259..a5c6eb2 100644
      }
      ++new_pipelines_;
      if (entry->pipeline == VK_NULL_HANDLE) {
-@@ -552,19 +632,22 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -552,19 +658,22 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
          return nullptr;
      }
      entry->listed = true;
@@ -1799,7 +1829,7 @@ index d591259..a5c6eb2 100644
      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
      stages[0].module = vs;
      stages[0].pName = "main";
-@@ -629,7 +712,7 @@ VkPipeline Renderer::build_pipeline(const PipelineKey& k, VkShaderModule vs, VkS
+@@ -629,7 +738,7 @@ VkPipeline Renderer::build_pipeline(const PipelineKey& k, VkShaderModule vs, VkS
      ri.stencilAttachmentFormat = has_stencil(depth) ? depth : VK_FORMAT_UNDEFINED;
      VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
      gci.pNext = &ri;
@@ -1808,7 +1838,7 @@ index d591259..a5c6eb2 100644
      gci.pStages = stages;
      gci.pVertexInputState = &vi;
      gci.pInputAssemblyState = &ia;
-@@ -716,11 +799,26 @@ uint32_t read_extent(uint32_t size, uint32_t extent) {
+@@ -716,11 +825,26 @@ uint32_t read_extent(uint32_t size, uint32_t extent) {
  }
  } // namespace
  
@@ -1836,7 +1866,7 @@ index d591259..a5c6eb2 100644
      const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
  
      // Primitive type: Vulkan topology, or a conversion through indices.
-@@ -740,6 +838,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -740,6 +864,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -1847,7 +1877,7 @@ index d591259..a5c6eb2 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -759,20 +861,93 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -759,20 +887,93 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          if (vh == std::strtoull(skip, nullptr, 16)) return;
      }
  
@@ -1944,7 +1974,7 @@ index d591259..a5c6eb2 100644
      }
      // A pass is clipped to its smallest attachment, the console's GPU is not:
      // a title-sized target drawn with upscaled ones is upscaled too, and an
-@@ -816,8 +991,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -816,8 +1017,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      ShaderEnvironment vs_env, ps_env;
      build_environment(regs.value, Stage::kVertex, vs_env);
      build_environment(regs.value, Stage::kPixel, ps_env);
@@ -1974,7 +2004,7 @@ index d591259..a5c6eb2 100644
      const ShaderModule* ps = shader(Stage::kPixel, r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, 0, 0,
                                      ps_env);
      if (vs == nullptr || ps == nullptr) {
-@@ -832,6 +1026,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -832,6 +1052,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          VkImageView view;
          VkSampler sampler;
          bool scaled;
@@ -2010,7 +2040,7 @@ index d591259..a5c6eb2 100644
      };
      Bound vs_textures[abi::kTextureSlots]{}, ps_textures[abi::kTextureSlots]{};
      const auto bind_textures = [&](const ShaderModule* s, uint32_t resource_base, uint32_t sampler_base,
-@@ -850,7 +1073,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -850,7 +1099,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  // take, or the title relies on it): the GPU reads zeros, and
                  // the shader declared a 2D float texture. (Fallen Garden's
                  // water has such a slot; skipping the draw left no water.)
@@ -2020,7 +2050,7 @@ index d591259..a5c6eb2 100644
                  continue;
              }
              const Texture* t = texture(words);
-@@ -858,7 +1082,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -858,7 +1108,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  report_once("draw skipped: texture could not be created, format", words[1] >> 26);
                  return false;
              }
@@ -2030,7 +2060,7 @@ index d591259..a5c6eb2 100644
          }
          return true;
      };
-@@ -871,16 +1096,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -871,16 +1122,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkFormat formats[8]{};
      for (uint32_t i = 0; i < color_count; ++i) formats[i] = colors[i] ? colors[i]->image.format : VK_FORMAT_UNDEFINED;
      const VkFormat depth_format = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
@@ -2067,7 +2097,7 @@ index d591259..a5c6eb2 100644
      if (pipe->state.load() != Built::kReady) {
          ++deferred_draws_; // its pipeline still compiling
          return;
-@@ -888,7 +1132,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -888,7 +1158,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
  
      // Per-draw constants.
      abi::DrawConstants dc{};
@@ -2076,7 +2106,7 @@ index d591259..a5c6eb2 100644
      ConstantSources sources;
      for (uint32_t i = 0; i < 16; ++i) {
          if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
-@@ -957,21 +1201,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -957,21 +1227,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f * pass_scale;
      dc.pixel_scale = pass_scale;
      dc.texture_scale = target_scale();
@@ -2125,7 +2155,7 @@ index d591259..a5c6eb2 100644
      }
  
      // Indices, converted to 32-bit host order (and to triangles for quads).
-@@ -1069,6 +1337,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1363,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -2142,7 +2172,7 @@ index d591259..a5c6eb2 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1077,6 +1355,99 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1077,6 +1381,99 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          else barrier();
      }
  
@@ -2242,7 +2272,7 @@ index d591259..a5c6eb2 100644
      // The rendering pass.
      if (!rendering_ || pass_depth_ != depth ||
          !std::equal(colors.begin(), colors.end(), pass_colors_.begin())) {
-@@ -1186,7 +1557,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1583,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -2266,7 +2296,7 @@ index d591259..a5c6eb2 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1209,7 +1595,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1209,7 +1621,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkCullModeFlags cull = 0;
      if (mode & 1) cull |= VK_CULL_MODE_FRONT_BIT;
      if (mode & 2) cull |= VK_CULL_MODE_BACK_BIT;
@@ -2276,7 +2306,7 @@ index d591259..a5c6eb2 100644
      // FACE: 0 counter-clockwise front, in the y-down window space Vulkan uses too.
      vkCmdSetFrontFace(c, (mode >> 2) & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
      vkCmdSetPrimitiveTopology(c, topology);
-@@ -1243,7 +1630,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1243,7 +1656,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          no_depth = range && count >= std::strtoul(range, nullptr, 10) &&
                     count <= std::strtoul(std::strchr(range, ',') + 1, nullptr, 10);
      }
@@ -2286,7 +2316,7 @@ index d591259..a5c6eb2 100644
      vkCmdSetDepthWriteEnable(c, has_depth && (((depth_control >> 2) & 1) || no_depth)); // (no_depth: shows its depth)
      // (no_depth: always passes, still writing depth.)
      vkCmdSetDepthCompareOp(c, no_depth ? VK_COMPARE_OP_ALWAYS : static_cast<VkCompareOp>((depth_control >> 4) & 7));
-@@ -1273,6 +1661,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1273,6 +1687,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 8) & 0xFF);
      vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 16) & 0xFF);
  
@@ -2307,7 +2337,7 @@ index d591259..a5c6eb2 100644
      if (tracing()) {
          uint64_t vh = 0, ph = 0, fh = 0;
          program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
-@@ -1285,6 +1687,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1713,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -2341,7 +2371,7 @@ index d591259..a5c6eb2 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1731,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1757,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -2367,7 +2397,7 @@ index d591259..a5c6eb2 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,10 +1761,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,10 +1787,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -2447,7 +2477,7 @@ index d591259..a5c6eb2 100644
          std::fprintf(stderr, "trace:   viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X\n", viewport.x,
                       viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x,
                       scissor.offset.y, scissor.extent.width, scissor.extent.height, mode & 7);
-@@ -1325,9 +1842,214 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,9 +1868,215 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -2458,7 +2488,7 @@ index d591259..a5c6eb2 100644
 +    { // port/patch_pixel_writers.py: TTT2_PIXEL_WRITERS=<seconds>,<fx>,<fy>
 +        static const char* spec = std::getenv("TTT2_PIXEL_WRITERS");
 +        if (spec != nullptr) {
-+            struct Rec { uint32_t draw; uint64_t vs, ps; uint32_t address, format, w, h; bool depth; };
++            struct Rec { uint32_t draw; uint64_t vs, ps; uint32_t address, format, w, h; bool depth; uint32_t clip, zctl, alpha, tmask, count; };
 +            static constexpr uint32_t kMax = 4096;
 +            static Buffer rb{};
 +            static std::vector<Rec> recs;
@@ -2505,13 +2535,13 @@ index d591259..a5c6eb2 100644
 +                            std::snprintf(before, sizeof(before), "%02x%02x%02x%02x %02x%02x%02x%02x", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
 +                        }
 +                    }
-+                    std::fprintf(stderr, "pixel: draw %u vs %016llx ps %016llx %s 0x%08X fmt 0x%03X %ux%u: %s -> %s\n", rc.draw,
++                    std::fprintf(stderr, "pixel: draw %u vs %016llx ps %016llx %s 0x%08X fmt 0x%03X %ux%u: %s -> %s (count %u clip 0x%08X zctl 0x%08X alpha 0x%X tmask 0x%X)\n", rc.draw,
 +                                 static_cast<unsigned long long>(rc.vs), static_cast<unsigned long long>(rc.ps),
-+                                 rc.depth ? "depth" : "color", rc.address, rc.format, rc.w, rc.h, before, after);
++                                 rc.depth ? "depth" : "color", rc.address, rc.format, rc.w, rc.h, before, after, rc.count, rc.clip, rc.zctl, rc.alpha, rc.tmask);
 +                    last[key] = v;
 +                }
 +            }
-+            if (state == 1 && frame_number_ == frame && recs.size() + 2 <= kMax) {
++            if (state == 1 && frame_number_ == frame && recs.size() + 9 <= kMax) {
 +                ++n;
 +                uint64_t vh = 0, ph = 0;
 +                program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
@@ -2527,9 +2557,10 @@ index d591259..a5c6eb2 100644
 +                    rg.imageExtent = {1, 1, 1};
 +                    if (is_depth && img.format != VK_FORMAT_D32_SFLOAT && img.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
 +                    vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rg);
-+                    recs.push_back({n, vh, ph, t->address, t->format, img.width, img.height, is_depth});
++                    recs.push_back({n, vh, ph, t->address, t->format, img.width, img.height, is_depth, r(reg::PA_CL_CLIP_CNTL),
++                                     r(reg::DB_DEPTH_CONTROL), r(reg::SX_ALPHA_TEST_CONTROL), r(reg::CB_TARGET_MASK), d.count});
 +                };
-+                copy(colors[0], false);
++                for (uint32_t ci = 0; ci < 8; ++ci) copy(colors[ci], false); // every render target of the draw
 +                copy(depth, true);
 +                barrier();
 +            }
@@ -2663,7 +2694,7 @@ index d591259..a5c6eb2 100644
      // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
      if (tracing()) {
          static uint64_t frame = UINT64_MAX;
-@@ -1436,6 +2158,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1436,6 +2185,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  const uint32_t w = x1 - x0, h = y1 - y0, texel = 8, bytes = w * h * texel;
                  VkDeviceSize offset = 0;
                  upload(bytes, 16, offset);

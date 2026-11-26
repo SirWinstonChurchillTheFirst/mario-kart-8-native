@@ -31,7 +31,7 @@ d = sys.argv[1] + "/gpu/vulkan/"
 BLOCK = r'''    { // port/patch_pixel_writers.py: TTT2_PIXEL_WRITERS=<seconds>,<fx>,<fy>
         static const char* spec = std::getenv("TTT2_PIXEL_WRITERS");
         if (spec != nullptr) {
-            struct Rec { uint32_t draw; uint64_t vs, ps; uint32_t address, format, w, h; bool depth; };
+            struct Rec { uint32_t draw; uint64_t vs, ps; uint32_t address, format, w, h; bool depth; uint32_t clip, zctl, alpha, tmask, count; };
             static constexpr uint32_t kMax = 4096;
             static Buffer rb{};
             static std::vector<Rec> recs;
@@ -78,13 +78,13 @@ BLOCK = r'''    { // port/patch_pixel_writers.py: TTT2_PIXEL_WRITERS=<seconds>,<
                             std::snprintf(before, sizeof(before), "%02x%02x%02x%02x %02x%02x%02x%02x", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
                         }
                     }
-                    std::fprintf(stderr, "pixel: draw %u vs %016llx ps %016llx %s 0x%08X fmt 0x%03X %ux%u: %s -> %s\n", rc.draw,
+                    std::fprintf(stderr, "pixel: draw %u vs %016llx ps %016llx %s 0x%08X fmt 0x%03X %ux%u: %s -> %s (count %u clip 0x%08X zctl 0x%08X alpha 0x%X tmask 0x%X)\n", rc.draw,
                                  static_cast<unsigned long long>(rc.vs), static_cast<unsigned long long>(rc.ps),
-                                 rc.depth ? "depth" : "color", rc.address, rc.format, rc.w, rc.h, before, after);
+                                 rc.depth ? "depth" : "color", rc.address, rc.format, rc.w, rc.h, before, after, rc.count, rc.clip, rc.zctl, rc.alpha, rc.tmask);
                     last[key] = v;
                 }
             }
-            if (state == 1 && frame_number_ == frame && recs.size() + 2 <= kMax) {
+            if (state == 1 && frame_number_ == frame && recs.size() + 9 <= kMax) {
                 ++n;
                 uint64_t vh = 0, ph = 0;
                 program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
@@ -100,9 +100,10 @@ BLOCK = r'''    { // port/patch_pixel_writers.py: TTT2_PIXEL_WRITERS=<seconds>,<
                     rg.imageExtent = {1, 1, 1};
                     if (is_depth && img.format != VK_FORMAT_D32_SFLOAT && img.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
                     vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &rg);
-                    recs.push_back({n, vh, ph, t->address, t->format, img.width, img.height, is_depth});
+                    recs.push_back({n, vh, ph, t->address, t->format, img.width, img.height, is_depth, r(reg::PA_CL_CLIP_CNTL),
+                                     r(reg::DB_DEPTH_CONTROL), r(reg::SX_ALPHA_TEST_CONTROL), r(reg::CB_TARGET_MASK), d.count});
                 };
-                copy(colors[0], false);
+                for (uint32_t ci = 0; ci < 8; ++ci) copy(colors[ci], false); // every render target of the draw
                 copy(depth, true);
                 barrier();
             }
