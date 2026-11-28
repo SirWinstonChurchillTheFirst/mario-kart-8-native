@@ -682,10 +682,18 @@ index 09fdc0f..9e33dde 100644
      // command processor makes the CPU see that it has (retired timestamps,
      // end-of-pipe writes).
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..182089e 100644
+index eff48db..492b7da 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
-@@ -26,6 +26,18 @@
+@@ -18,6 +18,7 @@
+ #include "cafe/guest.h"
+ #include "cafe/runtime.h"
+ 
++#include <algorithm> // port/patch_cpu_wrote_merge.py
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -26,6 +27,18 @@
  #include <mutex>
  #include <thread>
  #include <vector>
@@ -704,7 +712,7 @@ index eff48db..182089e 100644
  
  extern "C" uint64_t cafe_ppc_timebase(void);
  
-@@ -48,6 +60,7 @@ uint64_t g_retired = 0;   // under the kernel lock
+@@ -48,6 +61,7 @@ uint64_t g_retired = 0;   // under the kernel lock
  
  std::mutex g_written_mutex;
  std::vector<std::pair<uint32_t, uint32_t>> g_written; // CPU writes not yet seen by the backend
@@ -712,7 +720,7 @@ index eff48db..182089e 100644
  
  std::once_flag g_started;
  std::unique_ptr<Backend> g_backend;
-@@ -183,7 +196,7 @@ void execute(uint32_t address, uint32_t words, int depth);
+@@ -183,7 +197,7 @@ void execute(uint32_t address, uint32_t words, int depth);
  // the GPU, in command order, on a thread of its own; meanwhile the command
  // processor goes on with the next commands, as the console's does.
  struct Retirement {
@@ -721,7 +729,7 @@ index eff48db..182089e 100644
      uint64_t done;     // the backend's completion value (Backend::flush)
      uint32_t address;
      uint64_t data;
-@@ -209,13 +222,18 @@ void retirement_main() {
+@@ -209,13 +223,18 @@ void retirement_main() {
              r = g_retire_queue.front();
              g_retire_queue.pop_front();
          }
@@ -740,7 +748,7 @@ index eff48db..182089e 100644
          }
      }
  }
-@@ -387,6 +405,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+@@ -387,6 +406,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
          case 3: retire_later({Retirement::kWriteClock, g_backend->flush(), target, 0}); break;
          default: break;
          }
@@ -749,7 +757,7 @@ index eff48db..182089e 100644
          break;
      }
      case pm4::kMemWrite: {
-@@ -460,6 +480,23 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+@@ -460,6 +481,23 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
              if (previous != 0) {
                  g_backend->idle(); // (a held-back submission would never finish)
                  g_backend->wait_for(previous);
@@ -773,7 +781,7 @@ index eff48db..182089e 100644
              }
              previous = done;
              frame_ready();
-@@ -559,8 +596,82 @@ void retire(uint64_t timestamp) {
+@@ -559,8 +597,82 @@ void retire(uint64_t timestamp) {
      os::wake(os::kWaitGpu);
  }
  
@@ -856,7 +864,7 @@ index eff48db..182089e 100644
      for (;;) {
          Submission s;
          {
-@@ -575,15 +686,19 @@ void command_processor_main() {
+@@ -575,15 +687,41 @@ void command_processor_main() {
              g_queue.pop_front();
          }
          {
@@ -866,8 +874,31 @@ index eff48db..182089e 100644
                  std::lock_guard lock(g_written_mutex);
                  written.swap(g_written);
 +                stored.swap(g_stored); // port/patch_texture_stores.py
++            }
++            // port/patch_cpu_wrote_merge.py: the union of the batch's CPU writes (same bytes, far fewer calls)
++            static const bool merge_written = [] {
++                const char* v = std::getenv("TTT2_CPU_WROTE_MERGE");
++                return !(v && v[0] == '0');
++            }();
++            if (merge_written && written.size() > 1) {
++                std::sort(written.begin(), written.end());
++                uint64_t a = written[0].first, e = a + written[0].second;
++                for (size_t i = 1; i <= written.size(); ++i) {
++                    if (i < written.size() && written[i].first <= e) {
++                        e = std::max<uint64_t>(e, uint64_t{written[i].first} + written[i].second);
++                        continue;
++                    }
++                    for (uint64_t p = a; p < e;) { // sizes stay 32-bit
++                        const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(e - p, 0x80000000u));
++                        g_backend->cpu_wrote(static_cast<uint32_t>(p), n);
++                        p += n;
++                    }
++                    if (i < written.size()) { a = written[i].first; e = a + written[i].second; }
++                }
++            } else {
++                for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
              }
-             for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
+-            for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
 +            for (const auto& [address, size] : stored) g_backend->texture_stored(address, size);
          }
 +        const uint64_t t0 = stat_now_ns();
@@ -877,7 +908,7 @@ index eff48db..182089e 100644
      }
  }
  
-@@ -626,14 +741,50 @@ uint64_t retired_timestamp() {
+@@ -626,14 +764,50 @@ uint64_t retired_timestamp() {
  
  bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
      os::KernelLock lock(os::kernel_mutex());
@@ -1580,7 +1611,7 @@ index 8397b1f..6675300 100644
          VkFormatProperties p;
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..ca27ae6 100644
+index d591259..ee432c4 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -1591,7 +1622,51 @@ index d591259..ca27ae6 100644
  
  #include "gpu/latte.h"
  #include "gx2/types.h"
-@@ -310,10 +311,39 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -283,10 +284,42 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+     if (p == nullptr) return nullptr;
+     const Program* fetch = nullptr;
+     if (stage == Stage::kVertex && fetch_address != 0) fetch = program(fetch_address, fetch_size, fetch_hash);
+-    const uint64_t keys[3] = {program_hash, fetch_hash, environment_key(env)};
++    // port/patch_shader_key_canon.py: the key holds only what the translation reads
++    static const bool full_key = std::getenv("TTT2_SHADER_KEY_FULL") != nullptr;
++    static const bool check_key = std::getenv("TTT2_SHADER_KEY_CHECK") != nullptr;
++    const uint32_t sampled_slots = p->sampled_slots | (fetch ? fetch->sampled_slots : 0u);
++    const uint64_t keys[3] = {program_hash, fetch_hash,
++                              full_key ? environment_key(env) : environment_key(env, sampled_slots)};
+     const uint64_t key = fnv(keys, sizeof(keys));
+     auto& entry = shaders_[key];
+     if (entry) {
++        if (check_key && !entry->failed) {
++            static uint64_t checked = 0, wrong = 0;
++            static auto next_print = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++            latte::TranslatedShader again;
++            std::string check_error;
++            if (translate(*p, fetch, env, again, check_error)) {
++                ++checked;
++                if (fnv(again.glsl.data(), again.glsl.size()) != entry->glsl_hash) {
++                    if (++wrong <= 20) {
++                        std::fprintf(stderr, "ttt2: shader key check: MISMATCH %s %016llx key %016llx\n",
++                                     stage == Stage::kVertex ? "vs" : "ps", static_cast<unsigned long long>(program_hash),
++                                     static_cast<unsigned long long>(key));
++                        if (const char* dir = dump_directory()) { // beside the first text ps_<hash>_<key>.glsl
++                            char name[160];
++                            std::snprintf(name, sizeof(name), "mismatch_%s_%016llx_%016llx.glsl", stage == Stage::kVertex ? "vs" : "ps",
++                                          static_cast<unsigned long long>(program_hash), static_cast<unsigned long long>(key));
++                            std::ofstream(std::filesystem::path(dir) / name) << again.glsl;
++                        }
++                    }
++                }
++            }
++            if (std::chrono::steady_clock::now() >= next_print) {
++                std::fprintf(stderr, "ttt2: shader key check: %llu hits translated again, %llu with another text\n",
++                             static_cast<unsigned long long>(checked), static_cast<unsigned long long>(wrong));
++                next_print = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++            }
++        }
+         if (entry->module == VK_NULL_HANDLE && !entry->failed) resolve_module(*entry);
+         return entry->failed ? nullptr : entry.get();
+     }
+@@ -310,10 +343,96 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
                        static_cast<unsigned long long>(key));
          std::ofstream(std::filesystem::path(dir) / name) << entry->info.glsl;
      }
@@ -1625,13 +1700,70 @@ index d591259..ca27ae6 100644
      // shared by it (precompile() makes those of earlier runs).
      const uint64_t glsl_hash = fnv(entry->info.glsl.data(), entry->info.glsl.size());
      entry->glsl_hash = glsl_hash;
++    { // port/patch_trace_shader_keys.py
++        static const bool trace_keys = std::getenv("TTT2_TRACE_SHADER_KEYS") != nullptr;
++        if (trace_keys) {
++            static std::unordered_map<uint64_t, ShaderEnvironment> last_env;
++            static std::unordered_map<uint64_t, uint32_t> seen_text;
++            static auto next_print = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++            static uint32_t n = 0, same = 0, first = 0, d_tex = 0, d_vsem = 0, d_out = 0, d_psin = 0, d_w2 = 0, d_cb = 0,
++                            d_alpha = 0, d_misc = 0, d_none = 0;
++            ++n;
++            if (seen_text[glsl_hash]++) ++same;
++            const uint64_t pk[3] = {program_hash, fetch_hash, static_cast<uint64_t>(stage)};
++            const uint64_t pkey = fnv(pk, sizeof pk);
++            auto found = last_env.find(pkey);
++            if (found == last_env.end()) {
++                ++first;
++            } else {
++                const ShaderEnvironment& o = found->second;
++                bool any = false;
++                const auto differs = [&](bool d, uint32_t& counter) {
++                    if (d) { ++counter; any = true; }
++                };
++                bool tex = false;
++                for (int i = 0; i < 18; ++i) tex |= o.textures[i].dim != env.textures[i].dim || o.textures[i].kind != env.textures[i].kind;
++                differs(tex, d_tex);
++                differs(std::memcmp(o.vtx_semantic, env.vtx_semantic, sizeof o.vtx_semantic) != 0, d_vsem);
++                differs(std::memcmp(o.vs_out_semantic, env.vs_out_semantic, sizeof o.vs_out_semantic) != 0, d_out);
++                bool psin = o.ps_input_count != env.ps_input_count || o.ps_position_input != env.ps_position_input;
++                for (int k = 0; k < 32 && !psin; ++k) {
++                    psin = o.ps_inputs[k].semantic != env.ps_inputs[k].semantic || o.ps_inputs[k].flat != env.ps_inputs[k].flat ||
++                           o.ps_inputs[k].linear != env.ps_inputs[k].linear || o.ps_inputs[k].centroid != env.ps_inputs[k].centroid ||
++                           o.ps_inputs[k].default_value != env.ps_inputs[k].default_value ||
++                           o.ps_inputs[k].point_sprite != env.ps_inputs[k].point_sprite;
++                }
++                differs(psin, d_psin);
++                differs(std::memcmp(o.vtx_const_word2, env.vtx_const_word2, sizeof o.vtx_const_word2) != 0, d_w2);
++                differs(o.cb_shader_mask != env.cb_shader_mask || o.multiwrite != env.multiwrite ||
++                            std::memcmp(o.color_kind, env.color_kind, sizeof o.color_kind) != 0, d_cb);
++                differs(o.alpha_func != env.alpha_func, d_alpha);
++                differs(o.clip_space_dx != env.clip_space_dx || o.rects != env.rects || o.point_size_export != env.point_size_export ||
++                            o.stream_out_mask != env.stream_out_mask || o.uniform_registers != env.uniform_registers ||
++                            o.ps_front_face != env.ps_front_face || o.ps_param_gen_gpr != env.ps_param_gen_gpr || o.gs_part != env.gs_part, d_misc);
++                if (!any) ++d_none;
++            }
++            last_env[pkey] = env;
++            if (std::chrono::steady_clock::now() >= next_print) {
++                std::fprintf(stderr,
++                             "ttt2: shader keys: %u translations (%u same text as an earlier one, %u first of their program); "
++                             "differed from the program's last environment in: textures %u, vtx semantics %u, vs outputs %u, "
++                             "ps inputs %u, attribute formats %u, colour targets/mask %u, alpha test %u, other %u, nothing listed %u; "
++                             "%zu programs, %zu texts\n",
++                             n, same, first, d_tex, d_vsem, d_out, d_psin, d_w2, d_cb, d_alpha, d_misc, d_none, last_env.size(),
++                             seen_text.size());
++                n = same = first = d_tex = d_vsem = d_out = d_psin = d_w2 = d_cb = d_alpha = d_misc = d_none = 0;
++                next_print = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++            }
++        }
++    }
 +    // port/patch_shader_text_release.py: the text goes to the compile (once per glsl_hash), not into the cache entry.
 +    std::string glsl_text = std::move(entry->info.glsl);
 +    entry->info.glsl = std::string();
      if (auto it = modules_.find(glsl_hash); it != modules_.end()) {
          entry->module = it->second;
          return entry.get();
-@@ -323,7 +353,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -323,7 +442,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
          if (!pending_modules_.count(glsl_hash)) {
              auto pending = std::make_shared<PendingModule>();
              pending_modules_[glsl_hash] = pending;
@@ -1640,7 +1772,7 @@ index d591259..ca27ae6 100644
                             program_hash] {
                  std::vector<uint32_t> code = load_cached_spirv(glsl_hash);
                  if (code.empty()) {
-@@ -368,7 +398,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -368,7 +487,7 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
          shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_zero);
          Timed timed{spent_compile_};
          shaderc_compilation_result_t result = shaderc_compile_into_spv(
@@ -1649,7 +1781,7 @@ index d591259..ca27ae6 100644
              stage == Stage::kVertex ? shaderc_vertex_shader : shaderc_fragment_shader, kind, "main", options);
          shaderc_compile_options_release(options);
          if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
-@@ -389,6 +419,75 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
+@@ -389,6 +508,75 @@ const ShaderModule* Renderer::shader(Stage stage, uint32_t address, uint32_t siz
      return entry.get();
  }
  
@@ -1725,7 +1857,7 @@ index d591259..ca27ae6 100644
  // Takes `entry`'s module from a finished worker compile, if any.
  void Renderer::resolve_module(ShaderModule& entry) {
      if (auto it = modules_.find(entry.glsl_hash); it != modules_.end()) {
-@@ -457,13 +556,15 @@ VkShaderModule Renderer::cached_module(uint64_t glsl_hash, const std::vector<uin
+@@ -457,13 +645,15 @@ VkShaderModule Renderer::cached_module(uint64_t glsl_hash, const std::vector<uin
  // -------------------------------------------------------------- pipelines
  
  VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_textures, bool vs_registers,
@@ -1744,7 +1876,7 @@ index d591259..ca27ae6 100644
      if (vs_registers) bindings.push_back({abi::kVsRegistersBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
      if (ps_registers) bindings.push_back({abi::kPsRegistersBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
      for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
-@@ -490,17 +591,22 @@ VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_tex
+@@ -490,17 +680,22 @@ VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_tex
  }
  
  const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs, const ShaderModule* ps,
@@ -1769,7 +1901,7 @@ index d591259..ca27ae6 100644
      for (uint32_t i = 0; i < color_count; ++i) {
          k.colors[i] = colors[i];
          if (colors[i] == VK_FORMAT_UNDEFINED) continue;
-@@ -521,7 +627,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -521,7 +716,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      if (entry) {
          const Built state = entry->state.load();
          if (state == Built::kFailed) return nullptr;
@@ -1778,7 +1910,7 @@ index d591259..ca27ae6 100644
              entry->listed = true;
              append_saved("pipelines.list", entry->key);
          }
-@@ -532,11 +638,11 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -532,11 +727,11 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      entry->ps = ps;
      entry->key = k;
      entry->layout = pipeline_layout(vs->info.texture_mask, ps->info.texture_mask, vs->info.uses_registers,
@@ -1793,7 +1925,7 @@ index d591259..ca27ae6 100644
              ++new_pipelines_;
              p->state = p->pipeline != VK_NULL_HANDLE ? Built::kReady : Built::kFailed;
          });
-@@ -544,7 +650,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -544,7 +739,7 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      }
      {
          Timed timed{spent_pipeline_};
@@ -1802,7 +1934,7 @@ index d591259..ca27ae6 100644
      }
      ++new_pipelines_;
      if (entry->pipeline == VK_NULL_HANDLE) {
-@@ -552,19 +658,22 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -552,19 +747,22 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
          return nullptr;
      }
      entry->listed = true;
@@ -1829,7 +1961,7 @@ index d591259..ca27ae6 100644
      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
      stages[0].module = vs;
      stages[0].pName = "main";
-@@ -629,7 +738,7 @@ VkPipeline Renderer::build_pipeline(const PipelineKey& k, VkShaderModule vs, VkS
+@@ -629,7 +827,7 @@ VkPipeline Renderer::build_pipeline(const PipelineKey& k, VkShaderModule vs, VkS
      ri.stencilAttachmentFormat = has_stencil(depth) ? depth : VK_FORMAT_UNDEFINED;
      VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
      gci.pNext = &ri;
@@ -1838,7 +1970,7 @@ index d591259..ca27ae6 100644
      gci.pStages = stages;
      gci.pVertexInputState = &vi;
      gci.pInputAssemblyState = &ia;
-@@ -716,11 +825,26 @@ uint32_t read_extent(uint32_t size, uint32_t extent) {
+@@ -716,11 +914,26 @@ uint32_t read_extent(uint32_t size, uint32_t extent) {
  }
  } // namespace
  
@@ -1866,7 +1998,7 @@ index d591259..ca27ae6 100644
      const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
  
      // Primitive type: Vulkan topology, or a conversion through indices.
-@@ -740,6 +864,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -740,6 +953,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -1877,7 +2009,7 @@ index d591259..ca27ae6 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -759,20 +887,93 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -759,20 +976,93 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          if (vh == std::strtoull(skip, nullptr, 16)) return;
      }
  
@@ -1974,7 +2106,7 @@ index d591259..ca27ae6 100644
      }
      // A pass is clipped to its smallest attachment, the console's GPU is not:
      // a title-sized target drawn with upscaled ones is upscaled too, and an
-@@ -816,8 +1017,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -816,8 +1106,27 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      ShaderEnvironment vs_env, ps_env;
      build_environment(regs.value, Stage::kVertex, vs_env);
      build_environment(regs.value, Stage::kPixel, ps_env);
@@ -2004,7 +2136,7 @@ index d591259..ca27ae6 100644
      const ShaderModule* ps = shader(Stage::kPixel, r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, 0, 0,
                                      ps_env);
      if (vs == nullptr || ps == nullptr) {
-@@ -832,6 +1052,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -832,6 +1141,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          VkImageView view;
          VkSampler sampler;
          bool scaled;
@@ -2040,7 +2172,7 @@ index d591259..ca27ae6 100644
      };
      Bound vs_textures[abi::kTextureSlots]{}, ps_textures[abi::kTextureSlots]{};
      const auto bind_textures = [&](const ShaderModule* s, uint32_t resource_base, uint32_t sampler_base,
-@@ -850,7 +1099,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -850,7 +1188,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  // take, or the title relies on it): the GPU reads zeros, and
                  // the shader declared a 2D float texture. (Fallen Garden's
                  // water has such a slot; skipping the draw left no water.)
@@ -2050,7 +2182,7 @@ index d591259..ca27ae6 100644
                  continue;
              }
              const Texture* t = texture(words);
-@@ -858,7 +1108,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -858,7 +1197,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  report_once("draw skipped: texture could not be created, format", words[1] >> 26);
                  return false;
              }
@@ -2060,7 +2192,7 @@ index d591259..ca27ae6 100644
          }
          return true;
      };
-@@ -871,16 +1122,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -871,16 +1211,35 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkFormat formats[8]{};
      for (uint32_t i = 0; i < color_count; ++i) formats[i] = colors[i] ? colors[i]->image.format : VK_FORMAT_UNDEFINED;
      const VkFormat depth_format = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
@@ -2097,7 +2229,7 @@ index d591259..ca27ae6 100644
      if (pipe->state.load() != Built::kReady) {
          ++deferred_draws_; // its pipeline still compiling
          return;
-@@ -888,7 +1158,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -888,7 +1247,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
  
      // Per-draw constants.
      abi::DrawConstants dc{};
@@ -2106,7 +2238,7 @@ index d591259..ca27ae6 100644
      ConstantSources sources;
      for (uint32_t i = 0; i < 16; ++i) {
          if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
-@@ -957,21 +1227,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -957,21 +1316,45 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f * pass_scale;
      dc.pixel_scale = pass_scale;
      dc.texture_scale = target_scale();
@@ -2155,7 +2287,7 @@ index d591259..ca27ae6 100644
      }
  
      // Indices, converted to 32-bit host order (and to triangles for quads).
-@@ -1069,6 +1363,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1452,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -2172,7 +2304,7 @@ index d591259..ca27ae6 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1077,6 +1381,99 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1077,6 +1470,99 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          else barrier();
      }
  
@@ -2272,7 +2404,7 @@ index d591259..ca27ae6 100644
      // The rendering pass.
      if (!rendering_ || pass_depth_ != depth ||
          !std::equal(colors.begin(), colors.end(), pass_colors_.begin())) {
-@@ -1186,7 +1583,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1672,22 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -2296,7 +2428,7 @@ index d591259..ca27ae6 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1209,7 +1621,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1209,7 +1710,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      VkCullModeFlags cull = 0;
      if (mode & 1) cull |= VK_CULL_MODE_FRONT_BIT;
      if (mode & 2) cull |= VK_CULL_MODE_BACK_BIT;
@@ -2306,7 +2438,7 @@ index d591259..ca27ae6 100644
      // FACE: 0 counter-clockwise front, in the y-down window space Vulkan uses too.
      vkCmdSetFrontFace(c, (mode >> 2) & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
      vkCmdSetPrimitiveTopology(c, topology);
-@@ -1243,7 +1656,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1243,7 +1745,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          no_depth = range && count >= std::strtoul(range, nullptr, 10) &&
                     count <= std::strtoul(std::strchr(range, ',') + 1, nullptr, 10);
      }
@@ -2316,7 +2448,7 @@ index d591259..ca27ae6 100644
      vkCmdSetDepthWriteEnable(c, has_depth && (((depth_control >> 2) & 1) || no_depth)); // (no_depth: shows its depth)
      // (no_depth: always passes, still writing depth.)
      vkCmdSetDepthCompareOp(c, no_depth ? VK_COMPARE_OP_ALWAYS : static_cast<VkCompareOp>((depth_control >> 4) & 7));
-@@ -1273,6 +1687,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1273,6 +1776,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 8) & 0xFF);
      vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (ref_bf >> 16) & 0xFF);
  
@@ -2337,7 +2469,7 @@ index d591259..ca27ae6 100644
      if (tracing()) {
          uint64_t vh = 0, ph = 0, fh = 0;
          program(r(reg::SQ_PGM_START_VS) << 8, r(reg::SQ_PGM_START_VS + 4) << 3, vh);
-@@ -1285,6 +1713,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1802,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -2371,7 +2503,7 @@ index d591259..ca27ae6 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1757,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1846,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -2397,7 +2529,7 @@ index d591259..ca27ae6 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,10 +1787,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,10 +1876,79 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -2477,7 +2609,7 @@ index d591259..ca27ae6 100644
          std::fprintf(stderr, "trace:   viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X\n", viewport.x,
                       viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x,
                       scissor.offset.y, scissor.extent.width, scissor.extent.height, mode & 7);
-@@ -1325,9 +1868,215 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,9 +1957,215 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -2694,7 +2826,7 @@ index d591259..ca27ae6 100644
      // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
      if (tracing()) {
          static uint64_t frame = UINT64_MAX;
-@@ -1436,6 +2185,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1436,6 +2274,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                  const uint32_t w = x1 - x0, h = y1 - y0, texel = 8, bytes = w * h * texel;
                  VkDeviceSize offset = 0;
                  upload(bytes, 16, offset);
@@ -2817,7 +2949,7 @@ index ceb2ba7..899f6f7 100644
  
  } // namespace cafe::gpu::vk
 diff --git a/runtime/src/gpu/vulkan/present.cpp b/runtime/src/gpu/vulkan/present.cpp
-index 0778742..52a31c2 100644
+index 0778742..83e400f 100644
 --- a/runtime/src/gpu/vulkan/present.cpp
 +++ b/runtime/src/gpu/vulkan/present.cpp
 @@ -47,6 +47,17 @@
@@ -2851,7 +2983,23 @@ index 0778742..52a31c2 100644
          const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
          std::fprintf(stderr, "stall: %.3f %.0f ms\n", now, (presented - last) * 1000.0);
      }
-@@ -516,7 +531,7 @@ void Renderer::present_timed(float reported_hz) {
+@@ -443,9 +458,13 @@ void Renderer::note_presentation(double scheduled, double presented) {
+     const auto pct = [&](double p) { return sorted[std::min(sorted.size() - 1, static_cast<size_t>(p * sorted.size()))]; };
+     std::fprintf(stderr,
+                  "ttt2: present: %.1f/s, interval mean %.2f ms, 5%% %.2f, 50%% %.2f, 95%% %.2f, max %.2f; "
+-                 "%u more than 2 ms late, %.2f ms late on average; lead %.1f ms\n",
++                 "%u more than 2 ms late, %.2f ms late on average; lead %.1f ms; over 25/50/100 ms: %u/%u/%u\n",
+                  sorted.size() / (presented - window), mean, pct(0.05), pct(0.5), pct(0.95), sorted.back(), late,
+-                 late_total / (sorted.size() + 1), present_lead_.load() * 1000.0);
++                 late_total / (sorted.size() + 1), present_lead_.load() * 1000.0,
++                 // port/patch_frame_hist.py: how many intervals of the window were long
++                 static_cast<unsigned>(sorted.end() - std::upper_bound(sorted.begin(), sorted.end(), 25.0)),
++                 static_cast<unsigned>(sorted.end() - std::upper_bound(sorted.begin(), sorted.end(), 50.0)),
++                 static_cast<unsigned>(sorted.end() - std::upper_bound(sorted.begin(), sorted.end(), 100.0)));
+     intervals.clear();
+     late = 0;
+     late_total = 0;
+@@ -516,7 +535,7 @@ void Renderer::present_timed(float reported_hz) {
              wi.semaphoreCount = 1;
              wi.pSemaphores = &timeline_;
              wi.pValues = &f.ready;
@@ -3286,10 +3434,18 @@ index c70b525..c0b43cf 100644
                       wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), busy_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1),
                       static_cast<unsigned long long>(blended_replays_),
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
-index 6739e5d..54ab772 100644
+index 6739e5d..dc08690 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
 +++ b/runtime/src/gpu/vulkan/renderer.h
-@@ -68,6 +68,8 @@ inline uint32_t unscaled(uint32_t pixels, float scale) {
+@@ -48,6 +48,7 @@
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set> // port/patch_target_evict_safe.py
+ #include <vector>
+ 
+ struct shaderc_compiler;
+@@ -68,6 +69,8 @@ inline uint32_t unscaled(uint32_t pixels, float scale) {
  struct Image {
      VkImage image = VK_NULL_HANDLE;
      VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -3298,7 +3454,7 @@ index 6739e5d..54ab772 100644
      VkImageView view = VK_NULL_HANDLE; // all levels and layers, identity swizzle
      VkFormat format = VK_FORMAT_UNDEFINED;
      VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-@@ -96,9 +98,14 @@ struct Target {
+@@ -96,9 +99,14 @@ struct Target {
      // start of the frame, and the next frame gets the real frame's.
      uint64_t written_frame = 0; // frame_number_ of the last write by a real frame
      bool carried = false;       // read before written in this frame
@@ -3313,7 +3469,7 @@ index 6739e5d..54ab772 100644
  };
  
  struct Texture {
-@@ -110,6 +117,7 @@ struct Texture {
+@@ -110,6 +118,7 @@ struct Texture {
      uint64_t hash = 0;       // of the guest data last loaded
      bool dirty = true;       // the CPU wrote its memory since it was loaded
      uint64_t used_frame = 0; // frame_number_ of the last draw that bound it (evict_textures)
@@ -3321,7 +3477,7 @@ index 6739e5d..54ab772 100644
      const Target* source = nullptr; // render target the contents came from
      float scale = 1;        // image size over the resource's size (copied from upscaled targets)
      // A replacement (gpu/replacements.h) matched the contents: its index,
-@@ -118,6 +126,15 @@ struct Texture {
+@@ -118,6 +127,15 @@ struct Texture {
      int replacement = -1;
      uint64_t replacement_generation = 0;
      bool rgba = false;
@@ -3337,7 +3493,7 @@ index 6739e5d..54ab772 100644
  };
  
  struct ShaderModule {
-@@ -181,6 +198,7 @@ public:
+@@ -181,6 +199,7 @@ public:
      void swap() override;
      void invalidate(uint32_t address, uint32_t size, uint32_t coherency_flags) override;
      void cpu_wrote(uint32_t address, uint32_t size) override;
@@ -3345,7 +3501,7 @@ index 6739e5d..54ab772 100644
      void sync() override;
      uint64_t flush() override;
      void wait_for(uint64_t value) override;
-@@ -205,6 +223,26 @@ private:
+@@ -205,6 +224,26 @@ private:
      uint64_t waits_by_[4] = {}, submits_counted_ = 0;
      bool flush_pending_ = false; // flush() held back a submission (see Renderer::flush)
      double last_submit_ = 0;
@@ -3372,7 +3528,7 @@ index 6739e5d..54ab772 100644
      void barrier();
      uint8_t* upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset);
      // `shared`: used by the presentation queue too (concurrent sharing).
-@@ -244,20 +282,50 @@ private:
+@@ -244,20 +283,50 @@ private:
          uint64_t value;     // submission that copies it to staging
          uint32_t staging;   // index in write_back_staging_
          uint32_t address, base_reg, tile_mode, bpp, pitch, height;
@@ -3424,7 +3580,7 @@ index 6739e5d..54ab772 100644
      VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
      Buffer depth_staging_; // video memory for depth -> texture copies
      // A 1x1 2D image of zeros, for texture slots with nothing bound.
-@@ -268,10 +336,15 @@ private:
+@@ -268,10 +337,15 @@ private:
      const ShaderModule* shader(latte::Stage stage, uint32_t address, uint32_t size, uint32_t fetch_address,
                                 uint32_t fetch_size, const latte::ShaderEnvironment& env);
      const latte::Program* program(uint32_t address, uint32_t size, uint64_t& hash);
@@ -3442,7 +3598,7 @@ index 6739e5d..54ab772 100644
      latte::abi::Buffer buffer_descriptor(uint32_t address, uint32_t size, uint32_t stride) const;
  
      // ---------------------------------------- interpolation (interpolate.cpp)
-@@ -339,6 +412,10 @@ private:
+@@ -339,6 +413,10 @@ private:
      void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
      void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
      uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
@@ -3453,7 +3609,7 @@ index 6739e5d..54ab772 100644
      bool uncapped_ = false;         // as many of those as the GPU keeps up with, presented without pacing or vsync
      bool replaying_ = false;
      bool replayed_ = false; // this frame's extra frames were rendered
-@@ -468,14 +545,22 @@ private:
+@@ -468,14 +546,22 @@ private:
      // Shaders and pipelines of earlier runs, compiled before the title starts.
      void precompile();
      VkShaderModule cached_module(uint64_t glsl_hash, const std::vector<uint32_t>* spirv);
@@ -3477,12 +3633,24 @@ index 6739e5d..54ab772 100644
      void save_sequence_image(uint32_t n);
  
      float scale_ = 1; // upscaling factor of screen-sized targets: 1, 1.5, 2, 3 or 4
-@@ -513,10 +598,21 @@ private:
+@@ -513,10 +599,51 @@ private:
      const Pipeline* bound_pipeline_ = nullptr;
  
      std::vector<std::unique_ptr<Target>> targets_;
 +    std::unordered_map<uint32_t, std::vector<Target*>> targets_by_address_; // port/patch_target_index.py
 +    std::map<uint32_t, std::vector<Target*>> targets_sorted_; // port/patch_target_index.py: by address
++    std::unordered_map<uint32_t, std::vector<Target*>> target_pages_; // port/patch_target_pages.py: 64 KB page -> targets
++    void index_target_pages(Target* t, bool add) { // port/patch_target_pages.py
++        if (t->end <= t->address) return;
++        for (uint64_t page = t->address >> 16; page <= (uint64_t{t->end} - 1) >> 16; ++page) {
++            if (add) {
++                target_pages_[static_cast<uint32_t>(page)].push_back(t);
++            } else if (const auto it = target_pages_.find(static_cast<uint32_t>(page)); it != target_pages_.end()) {
++                std::erase(it->second, t);
++                if (it->second.empty()) target_pages_.erase(it);
++            }
++        }
++    }
 +    uint32_t max_target_span_ = 0;
 +    uint64_t target_generation_ = 1; // port/patch_slice_cache.py: +1 for every target made
      std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
@@ -3493,13 +3661,31 @@ index 6739e5d..54ab772 100644
 +    // their images destroyed once the GPU passed the submission value beside them.
 +    void evict_targets();
 +    bool target_dispensable(const Target& t) const;
++    // port/patch_target_evict_safe.py: why a target may go ("cpu", "writeback", "overlap") or nullptr; layer 0 of a
++    // surface with slice targets; places whose last write-back did not reach guest memory (under write_back_mutex_).
++    const char* target_free_reason(const Target& t) const;
++    bool layer_zero_of_slices(const Target& t) const;
++    std::unordered_set<uint32_t> write_back_lost_;
 +    std::deque<std::pair<uint64_t, std::unique_ptr<Target>>> retired_targets_;
 +    size_t evict_cursor_ = 0;
 +    uint64_t target_bytes_ = 0, sweep_bytes_ = 0, targets_freed_ = 0;
++    // port/patch_trace_loss.py (TTT2_TRACE_LOSS=1): freed targets by address, and places whose last write-back was skipped
++    struct FreedTarget {
++        char why = 0;
++        bool layered = false;
++        uint32_t format = 0, pitch = 0, height = 0;
++        uint64_t frame = 0;
++    };
++    std::unordered_map<uint32_t, FreedTarget> freed_log_;
++    std::unordered_map<uint32_t, uint32_t> write_back_skips_; // under write_back_mutex_
++    static bool trace_loss() {
++        static const bool on = std::getenv("TTT2_TRACE_LOSS") != nullptr;
++        return on;
++    }
      // Textures and shader programs by the 64 KiB pages of guest memory they
      // use, for the CPU-write and cache-invalidation notices (hundreds a frame).
      std::unordered_map<uint32_t, std::vector<Texture*>> texture_pages_;
-@@ -576,7 +672,10 @@ private:
+@@ -576,7 +703,10 @@ private:
      std::vector<VkSemaphore> rendered_;
  
      // TTT2_TRACE_FRAME=n: log every command of frame n (counted from 0).
@@ -3512,7 +3698,7 @@ index 6739e5d..54ab772 100644
      uint64_t trace_frame_ = UINT64_MAX;
  
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..82b30ba 100644
+index 5bd50e6..f716bfc 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
 @@ -10,7 +10,13 @@
@@ -3583,7 +3769,7 @@ index 5bd50e6..82b30ba 100644
      const uint32_t width = scaled(pitch, t->scale), rows = scaled(height, t->scale);
      t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, width, rows, 1, 1,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-@@ -103,16 +120,72 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -103,16 +120,74 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
                              VK_IMAGE_VIEW_TYPE_2D);
      t->written = stamp();
      t->written_frame = frame_number_;
@@ -3594,8 +3780,10 @@ index 5bd50e6..82b30ba 100644
      }
 +    targets_by_address_[t->address].push_back(t.get()); // port/patch_target_index.py
 +    targets_sorted_[t->address].push_back(t.get());
++    index_target_pages(t.get(), true); // port/patch_target_pages.py
 +    ++target_generation_; // port/patch_slice_cache.py
 +    max_target_span_ = std::max(max_target_span_, t->end - t->address);
++    if (trace_loss()) freed_log_.erase(t->address); // port/patch_trace_loss.py
 +    if (static const bool reload = std::getenv("TTT2_RELOAD_TARGETS") != nullptr && std::atoi(std::getenv("TTT2_RELOAD_TARGETS")) != 0;
 +        reload) {
 +        t->overwritten = stamp(); // port/patch_reload_targets.py: its memory first
@@ -3657,7 +3845,7 @@ index 5bd50e6..82b30ba 100644
  }
  
  Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t info_reg) {
-@@ -121,9 +194,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -121,9 +196,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
      const uint32_t format = depth_buffer_surface_format(info_reg);
      const uint32_t pitch = ((size_reg & 0x3FF) + 1) * 8;
      const uint32_t height = (((size_reg >> 10) & 0xFFFFF) + 1) * 64 / pitch;
@@ -3673,19 +3861,20 @@ index 5bd50e6..82b30ba 100644
          }
      }
      const FormatInfo f = depth_format(format);
-@@ -150,6 +226,11 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+@@ -150,6 +228,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
                              VK_IMAGE_VIEW_TYPE_2D);
      t->written = stamp();
      t->written_frame = frame_number_;
 +    t->used_frame = frame_number_; // port/patch_target_eviction.py
 +    targets_by_address_[t->address].push_back(t.get()); // port/patch_target_index.py
 +    targets_sorted_[t->address].push_back(t.get());
++    index_target_pages(t.get(), true); // port/patch_target_pages.py
 +    ++target_generation_; // port/patch_slice_cache.py
 +    max_target_span_ = std::max(max_target_span_, t->end - t->address);
      targets_.push_back(std::move(t));
      return targets_.back().get();
  }
-@@ -181,8 +262,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -181,8 +265,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -3701,7 +3890,7 @@ index 5bd50e6..82b30ba 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
-@@ -194,11 +280,15 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -194,11 +283,15 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      t.start_copied = false;
      t.scale = scale;
      t.written = stamp();
@@ -3719,7 +3908,7 @@ index 5bd50e6..82b30ba 100644
  }
  
  // ----------------------------------------------------------------- clears
-@@ -245,6 +335,45 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+@@ -245,6 +338,45 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
      profile_mark("clear depth", t->address, t->image.width, t->image.height);
      t->written = stamp();
      note_target_written(t);
@@ -3765,7 +3954,7 @@ index 5bd50e6..82b30ba 100644
      if (tracing()) {
          std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                       t->pitch, t->height, flags, depth, stencil);
-@@ -420,9 +549,33 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+@@ -420,9 +552,33 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
  // ------------------------------------------------------------ write-back
  
  void Renderer::queue_write_back(Target* t) {
@@ -3799,16 +3988,20 @@ index 5bd50e6..82b30ba 100644
  }
  
  // At the end of a submission: the targets it wrote, copied to staging memory.
-@@ -435,12 +588,28 @@ void Renderer::copy_write_backs() {
+@@ -435,12 +591,31 @@ void Renderer::copy_write_backs() {
      for (Target* t : write_back_targets_) {
          t->write_back_queued = false;
          const uint32_t bytes = color_format(t->format).bytes;
+-        if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
 +        // port/patch_writeback_early.py: the bytes remembered at the target's first draw of this batch.
 +        std::vector<uint8_t> early;
 +        for (EarlyBefore& e : write_back_early_) {
 +            if (e.target == t) early = std::move(e.bytes);
 +        }
-         if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
++        if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) {
++            write_back_lost_.insert(t->address); // port/patch_target_evict_safe.py
++            continue;
++        }
          if (write_back_free_.empty()) {
              write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
 -            write_back_staging_.push_back(ctx_.create_buffer(
@@ -3831,7 +4024,7 @@ index 5bd50e6..82b30ba 100644
          }
          const uint32_t staging = write_back_free_.back();
          write_back_free_.pop_back();
-@@ -449,13 +618,40 @@ void Renderer::copy_write_backs() {
+@@ -449,13 +624,40 @@ void Renderer::copy_write_backs() {
          region.imageExtent = {t->pitch, t->height, 1};
          vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
                                 &region);
@@ -3873,7 +4066,7 @@ index 5bd50e6..82b30ba 100644
      // For the host, and before the next submission's commands: its first
      // draw may render into a target these copies read.
      VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-@@ -472,6 +668,19 @@ void Renderer::copy_write_backs() {
+@@ -472,6 +674,19 @@ void Renderer::copy_write_backs() {
  // (Retirement thread.) The copies of the submissions up to `value`, tiled
  // into guest memory.
  void Renderer::retired(uint64_t value) {
@@ -3893,7 +4086,7 @@ index 5bd50e6..82b30ba 100644
      for (;;) {
          WriteBack w;
          const uint8_t* data;
-@@ -482,6 +691,39 @@ void Renderer::retired(uint64_t value) {
+@@ -482,6 +697,41 @@ void Renderer::retired(uint64_t value) {
              write_backs_.pop_front();
              data = write_back_staging_[w.staging].mapped;
          }
@@ -3908,6 +4101,8 @@ index 5bd50e6..82b30ba 100644
 +            }
 +            std::lock_guard lock(write_back_mutex_);
 +            write_back_free_.push_back(w.staging);
++            if (trace_loss()) ++write_back_skips_[w.address]; // port/patch_trace_loss.py
++            write_back_lost_.insert(w.address); // port/patch_target_evict_safe.py
 +            continue;
 +        }
 +        { // port/patch_dump_wb.py
@@ -3933,13 +4128,15 @@ index 5bd50e6..82b30ba 100644
          TiledLevel level{};
          level.data = guest_pointer(w.address);
          level.base256b = w.base_reg;
-@@ -492,8 +734,138 @@ void Renderer::retired(uint64_t value) {
+@@ -492,8 +742,194 @@ void Renderer::retired(uint64_t value) {
          level.slices = 1;
          level.samples = 1;
          tile(level, w.pitch, w.height, 0, 1, data);
 +        add_stat(kStatWriteBackBytes, uint64_t{w.pitch} * w.height * w.bpp / 8);
          std::lock_guard lock(write_back_mutex_);
          write_back_free_.push_back(w.staging);
++        if (trace_loss()) write_back_skips_.erase(w.address); // port/patch_trace_loss.py
++        if (!write_back_lost_.empty()) write_back_lost_.erase(w.address); // port/patch_target_evict_safe.py
 +        // Later queued write-backs of the same place compare against what this one wrote.
 +        for (WriteBack& later : write_backs_) {
 +            if (later.address == w.address && !later.before.empty() && later.before.size() == n) {
@@ -3956,20 +4153,48 @@ index 5bd50e6..82b30ba 100644
 +// ------------------------------------------------------------ eviction (port/patch_target_eviction.py)
 +
 +// Nothing is lost when the target goes: its memory holds newer data, or its own (written back).
-+bool Renderer::target_dispensable(const Target& t) const {
-+    if (t.overwritten > t.written) return true; // the CPU wrote its memory since: textures read that memory anyway
++// port/patch_target_evict_safe.py: a slice target of its size one slice further = it is layer 0 of a layered surface,
++// also before any texture has bound that surface.
++bool Renderer::layer_zero_of_slices(const Target& t) const {
++    if (t.depth) return false;
++    const uint32_t bytes = std::max(1u, color_format(t.format).bytes);
++    const auto it = targets_by_address_.find(t.address + slice_key_bytes(t.pitch, t.height, bytes, t.tile_mode));
++    if (it == targets_by_address_.end()) return false;
++    for (const Target* u : it->second) {
++        if (u != &t && !u->depth && u->layered && u->pitch == t.pitch && u->height == t.height &&
++            std::max(1u, color_format(u->format).bytes) == bytes) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool Renderer::target_dispensable(const Target& t) const { return target_free_reason(t) != nullptr; }
++
++const char* Renderer::target_free_reason(const Target& t) const {
++    if (t.overwritten > t.written) return "cpu"; // the CPU wrote its memory since: textures read that memory anyway
 +    // port/patch_target_evict_layers.py: not a layer of a layered texture (its other layers are not in guest memory)
 +    if (t.write_back && !t.layered && std::getenv("TTT2_NO_WRITEBACK") == nullptr && std::getenv("TTT2_WRITEBACK_RANGE") == nullptr) {
-+        return true; // every GPU write of it was tiled into guest memory
++        static const bool safe = [] {
++            const char* v = std::getenv("TTT2_EVICT_SAFE");
++            return v == nullptr || *v != '0';
++        }();
++        if (!safe) return "writeback";
++        bool lost;
++        {
++            std::lock_guard lock(const_cast<std::mutex&>(write_back_mutex_));
++            lost = write_back_lost_.count(t.address) != 0;
++        }
++        if (!lost && !layer_zero_of_slices(t)) return "writeback"; // every GPU write of it was tiled into guest memory
 +    }
 +    // A newer target over (part of) its memory: on the console the GPU wrote over it there.
 +    const uint32_t from = t.address > max_target_span_ ? t.address - max_target_span_ : 0;
 +    for (auto it = targets_sorted_.lower_bound(from); it != targets_sorted_.end() && it->first < t.end; ++it) {
 +        for (const Target* u : it->second) {
-+            if (u != &t && u->end > t.address && u->address < t.end && u->written > t.written) return true;
++            if (u != &t && u->end > t.address && u->address < t.end && u->written > t.written) return "overlap";
 +        }
 +    }
-+    return false;
++    return nullptr;
 +}
 +
 +void Renderer::evict_targets() {
@@ -4024,7 +4249,8 @@ index 5bd50e6..82b30ba 100644
 +        }
 +        if (std::getenv("TTT2_TRACE_TARGETS")) {
 +            // port/patch_target_evict_layers.py: why it may go, and the newer target over it
-+            const char* why = t->overwritten > t->written ? "cpu" : t->write_back && !t->layered ? "writeback" : "overlap";
++            const char* why = target_free_reason(*t); // port/patch_target_evict_safe.py
++            if (why == nullptr) why = "?";
 +            const Target* over = nullptr;
 +            if (*why == 'o') {
 +                const uint32_t from = t->address > max_target_span_ ? t->address - max_target_span_ : 0;
@@ -4040,6 +4266,30 @@ index 5bd50e6..82b30ba 100644
 +            if (over) std::fprintf(stderr, " under 0x%08X fmt 0x%03X %ux%u", over->address, over->format, over->pitch, over->height);
 +            std::fprintf(stderr, "\n");
 +        }
++        if (trace_loss()) { // port/patch_trace_loss.py
++            const char* why = target_free_reason(*t); // port/patch_target_evict_safe.py
++            if (why == nullptr) why = "?";
++            freed_log_[t->address] = {*why, t->layered, t->format, t->pitch, t->height, frame_number_};
++            uint32_t users = 0;
++            for (auto& [key, tex] : textures_) {
++                bool uses = tex->source == t;
++                for (const Target* s : tex->slice_found) uses = uses || s == t;
++                if (!uses) continue;
++                ++users;
++                std::fprintf(stderr, "loss: freed %s target 0x%08X fmt 0x%03X %ux%u%s (%s, written %llu frames ago) was the source of texture 0x%08X "
++                             "(used %llu frames ago)\n",
++                             t->depth ? "depth" : "color", t->address, t->format, t->pitch, t->height, t->layered ? " layered" : "", why,
++                             static_cast<unsigned long long>(frame_number_ - t->written_frame), tex->words[2] << 8,
++                             static_cast<unsigned long long>(frame_number_ - tex->used_frame));
++            }
++            if (*why == 'w') {
++                std::lock_guard lock(write_back_mutex_);
++                if (const auto it = write_back_skips_.find(t->address); it != write_back_skips_.end()) {
++                    std::fprintf(stderr, "loss: write-back skipped %u times for freed target 0x%08X fmt 0x%03X %ux%u (%u textures use it): "
++                                 "its contents are NOT in guest memory\n", it->second, t->address, t->format, t->pitch, t->height, users);
++                }
++            }
++        }
 +        const auto drop = [&](auto& index) {
 +            const auto it = index.find(t->address);
 +            if (it == index.end()) return;
@@ -4048,6 +4298,7 @@ index 5bd50e6..82b30ba 100644
 +        };
 +        drop(targets_by_address_);
 +        drop(targets_sorted_);
++        index_target_pages(t, false); // port/patch_target_pages.py
 +        gone[freed++] = t;
 +        // The batch being recorded is the last that could use it.
 +        retired_targets_.emplace_back(submitted_ + 1, std::move(targets_[evict_cursor_]));
@@ -4073,7 +4324,7 @@ index 5bd50e6..82b30ba 100644
  }
  
 diff --git a/runtime/src/gpu/vulkan/textures.cpp b/runtime/src/gpu/vulkan/textures.cpp
-index f5d0d7b..0fb11dc 100644
+index f5d0d7b..6a172c0 100644
 --- a/runtime/src/gpu/vulkan/textures.cpp
 +++ b/runtime/src/gpu/vulkan/textures.cpp
 @@ -12,11 +12,13 @@
@@ -4228,7 +4479,27 @@ index f5d0d7b..0fb11dc 100644
      const uint32_t levels = std::min(r.last_level + 1, 14u);
      const Target* sources[14] = {};
      uint64_t newest = 0;
-@@ -273,6 +335,58 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+@@ -254,6 +316,19 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+                                       : s.mipmaps + (level > 1 ? uint32_t{s.mip_level_offset[level - 1]} : 0u);
+         if (gx2::is_macro_tiled(r.tile_mode)) address &= ~0x700u;
+         const Target* src = find_target(address, 0, false);
++        if (trace_loss() && src == nullptr) { // port/patch_trace_loss.py
++            if (const auto fl = freed_log_.find(address); fl != freed_log_.end()) {
++                static std::set<uint64_t> said;
++                if (said.insert(uint64_t{address} << 32 | static_cast<uint32_t>(fl->second.frame)).second) {
++                    std::fprintf(stderr, "loss: texture 0x%08X fmt 0x%03X %ux%ux%u dim %u level %u from guest memory: its target (fmt 0x%03X %ux%u%s) "
++                                 "was freed %llu frames ago (%c)%s\n",
++                                 uint32_t{s.image}, r.format, r.width, r.height, r.depth, r.dim, level, fl->second.format, fl->second.pitch,
++                                 fl->second.height, fl->second.layered ? " layered" : "",
++                                 static_cast<unsigned long long>(frame_number_ - fl->second.frame), fl->second.why,
++                                 t.loaded == 0 ? " [new texture]" : "");
++                }
++            }
++        }
+         if (src == nullptr || src->written <= src->overwritten) {
+             if (level == 0) return false;
+             continue;
+@@ -273,6 +348,70 @@ bool Renderer::load_texture_from_targets(Texture& t) {
          note_target_read(src);
          newest = std::max(newest, src->written);
      }
@@ -4258,6 +4529,18 @@ index f5d0d7b..0fb11dc 100644
 +                for (uint32_t z = 1; z < slice_count; ++z) {
 +                    const auto it = targets_by_address_.find(s0->address + z * step);
 +                    keys[z] = it == targets_by_address_.end() ? nullptr : &it->second;
++                    if (trace_loss() && keys[z] == nullptr) { // port/patch_trace_loss.py
++                        if (const auto fl = freed_log_.find(s0->address + z * step); fl != freed_log_.end()) {
++                            static std::set<uint64_t> said;
++                            if (said.insert(uint64_t{s0->address + z * step} << 32 | static_cast<uint32_t>(fl->second.frame)).second) {
++                                std::fprintf(stderr, "loss: texture 0x%08X fmt 0x%03X %ux%ux%u dim %u level %u slice %u missing: its slice target "
++                                             "0x%08X was freed %llu frames ago (%c)%s\n",
++                                             uint32_t{s.image}, r.format, r.width, r.height, r.depth, r.dim, level, z, s0->address + z * step,
++                                             static_cast<unsigned long long>(frame_number_ - fl->second.frame), fl->second.why,
++                                             t.loaded == 0 ? " [new texture]" : "");
++                            }
++                        }
++                    }
 +                }
 +                t.slice_level_source[level] = s0;
 +            }
@@ -4287,7 +4570,7 @@ index f5d0d7b..0fb11dc 100644
      if (t.source == sources[0] && t.loaded >= newest && t.scale == sources[0]->scale) return true;
      // An upscaled target gives an upscaled texture; levels of another scale
      // than level 0 are left out.
-@@ -303,6 +417,26 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+@@ -303,6 +442,26 @@ bool Renderer::load_texture_from_targets(Texture& t) {
          vkCmdCopyImage(cmd(), src->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
                         &region);
      }
@@ -4314,7 +4597,7 @@ index f5d0d7b..0fb11dc 100644
      barrier();
      profile_mark("texture from target", sources[0]->address, scaled(r.width, scale), scaled(r.height, scale));
      t.source = sources[0];
-@@ -328,8 +462,39 @@ void Renderer::load_texture(Texture& t) {
+@@ -328,8 +487,39 @@ void Renderer::load_texture(Texture& t) {
                               r.format, src->format);
                  return;
              }
@@ -4355,7 +4638,7 @@ index f5d0d7b..0fb11dc 100644
                  t.source = src;
                  t.loaded = stamp();
                  t.dirty = false;
-@@ -348,7 +513,7 @@ void Renderer::load_texture(Texture& t) {
+@@ -348,7 +538,7 @@ void Renderer::load_texture(Texture& t) {
      // A replay renders the frame's data again: what the CPU wrote since is the next frame's.
      if (replaying_ && t.loaded != 0) return;
  
@@ -4364,7 +4647,7 @@ index f5d0d7b..0fb11dc 100644
      if (!guest_memory_committed(s.image, s.image_size) ||
          (s.mip_levels > 1 && !guest_memory_committed(s.mipmaps, s.mipmap_size))) {
          t.dirty = false;
-@@ -364,6 +529,10 @@ void Renderer::load_texture(Texture& t) {
+@@ -364,6 +554,10 @@ void Renderer::load_texture(Texture& t) {
      if (s.mip_levels > 1) h ^= hash_bytes(guest_pointer(s.mipmaps), s.mipmap_size) * 31;
      t.dirty = false;
      if (h == t.hash && t.source == nullptr && t.loaded != 0 && t.scale == 1) return;
@@ -4375,7 +4658,7 @@ index f5d0d7b..0fb11dc 100644
      if (t.scale != 1) create_texture_image(t, 1);
      t.hash = h;
      t.source = nullptr;
-@@ -570,15 +739,35 @@ void Renderer::evict_textures() {
+@@ -570,15 +764,35 @@ void Renderer::evict_textures() {
          return true;
      });
      constexpr uint64_t kUnusedFrames = 600;
@@ -4412,7 +4695,7 @@ index f5d0d7b..0fb11dc 100644
              for_pages(range[0], range[1], [&](uint32_t page) {
                  const auto p = texture_pages_.find(page);
                  if (p == texture_pages_.end()) return;
-@@ -627,10 +816,22 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
+@@ -627,10 +841,22 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
      if (size == 0 || !(coherency_flags & (1u << 23))) return;
      // Titles flush the whole cache every frame; CPU writes come through
      // cpu_wrote(), so only a ranged invalidation suggests changed data.
@@ -4436,17 +4719,32 @@ index f5d0d7b..0fb11dc 100644
  void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
      if (frames_per_frame_ > 1) forget_snapshots(address, size);
      const uint64_t end = uint64_t{address} + size;
-@@ -648,8 +849,11 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
+@@ -648,8 +874,26 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
      // (A flush of everything says nothing about render targets.)
      if (size < 0x10000000) {
          uint64_t now = 0;
 -        for (auto& t : targets_) {
 -            if (t->address < end && t->end > address) t->overwritten = now ? now : (now = stamp());
 +        const uint32_t from = address > max_target_span_ ? address - max_target_span_ : 0; // port/patch_target_index.py
++        // port/patch_target_pages.py: only the targets listed for the written 64 KB pages (same overlap test).
++        static const bool by_pages = [] {
++            const char* v = std::getenv("TTT2_TARGET_PAGES");
++            return !(v && v[0] == '0');
++        }();
++        if (by_pages) {
++            for_pages(address, end, [&](uint32_t page) {
++                const auto it = target_pages_.find(page);
++                if (it == target_pages_.end()) return;
++                for (Target* t : it->second) {
++                    if (t->address < end && t->end > address) t->overwritten = now ? now : (now = stamp());
++                }
++            });
++        } else {
 +        for (auto it = targets_sorted_.lower_bound(from); it != targets_sorted_.end() && it->first < end; ++it) {
 +            for (Target* t : it->second) {
 +                if (t->address < end && t->end > address) t->overwritten = now ? now : (now = stamp());
 +            }
++        }
          }
      }
      if (end - address > (64u << 20)) {
@@ -5211,8 +5509,24 @@ index 557d5b0..41b1cd5 100644
          if (entry.path().extension() != ".regs") continue;
          // draw_<vs>_<ps>_<fs>.regs
          const std::string vs = name.substr(5, 16), ps = name.substr(22, 16), fs = name.substr(39, 16);
+diff --git a/runtime/src/latte/decode.cpp b/runtime/src/latte/decode.cpp
+index 69e62f3..90f6061 100644
+--- a/runtime/src/latte/decode.cpp
++++ b/runtime/src/latte/decode.cpp
+@@ -311,6 +311,11 @@ bool decode(std::span<const uint32_t> words, Program& program, std::string& erro
+     std::sort(program.cf.begin(), program.cf.end(),
+               [](const CfInstruction& a, const CfInstruction& b) { return a.index < b.index; });
+     std::sort(program.subroutines.begin(), program.subroutines.end());
++    for (const auto& clause : program.tex_clauses) { // port/patch_shader_key_canon.py
++        for (const TexInstruction& t : clause) {
++            if (!t.vfetch && t.resource_id < 32) program.sampled_slots |= 1u << t.resource_id;
++        }
++    }
+     return true;
+ }
+ 
 diff --git a/runtime/src/latte/environment.cpp b/runtime/src/latte/environment.cpp
-index 6988565..9d33b2e 100644
+index 6988565..cdadd25 100644
 --- a/runtime/src/latte/environment.cpp
 +++ b/runtime/src/latte/environment.cpp
 @@ -10,6 +10,12 @@
@@ -5264,6 +5578,88 @@ index 6988565..9d33b2e 100644
      } else {
          h.add(env.ps_front_face | (env.ps_front_face_all_bits << 1) | (env.ps_front_face_gpr << 2) |
                (env.ps_front_face_chan << 10));
+@@ -134,4 +152,68 @@ uint64_t environment_key(const ShaderEnvironment& env) {
+     return h.h;
+ }
+ 
++// port/patch_shader_key_canon.py. Must list everything Translator reads from the environment (translate.cpp:
++// env_.textures[slot] only in emit_texture/the sampler declarations of sampled slots; env_.vs_out_semantic and
++// env_.ps_inputs[].semantic only compared with each other).
++uint64_t environment_key(const ShaderEnvironment& env, uint32_t sampled_slots) {
++    Hasher h;
++    h.add(static_cast<uint64_t>(env.stage));
++    h.add(env.uniform_registers);
++    for (uint32_t slot = 0; slot < 18; ++slot) {
++        if (!(sampled_slots & (1u << slot))) continue;
++        h.add(slot | (uint32_t{env.textures[slot].dim} << 8) | (static_cast<uint32_t>(env.textures[slot].kind) << 16));
++    }
++    h.add(env.ps_input_count);
++    h.add(static_cast<uint8_t>(env.ps_position_input));
++    // Which pixel-shader inputs each vertex parameter export feeds.
++    uint32_t feeds[32] = {};
++    uint32_t linked = 0;
++    for (int p = 0; p < 32; ++p) {
++        const uint8_t s = env.vs_out_semantic[p];
++        if (s == 0xFF) continue;
++        for (int k = 0; k < env.ps_input_count; ++k) {
++            if (env.ps_inputs[k].semantic != s) continue;
++            linked |= 1u << k; // the pixel shader's "exported" does not skip the position input
++            if (k != env.ps_position_input) feeds[p] |= 1u << k;
++        }
++    }
++    if (env.stage == Stage::kVertex) {
++        for (uint32_t f : feeds) h.add(f);
++        h.add(linked);
++        for (int k = 0; k < env.ps_input_count; ++k) {
++            const auto& in = env.ps_inputs[k];
++            if (linked & (1u << k)) h.add(k | (in.flat << 8) | (in.linear << 9) | (in.centroid << 10));
++        }
++        for (uint8_t s : env.vtx_semantic) h.add(s);
++        h.add(env.clip_space_dx | (env.point_size_export << 1) | (env.stream_out_mask << 2) | (env.rects << 6));
++        for (uint16_t s : env.stream_out_stride) h.add(s);
++        for (uint32_t w : env.vtx_const_word2) h.add(w);
++        h.add(env.gs_part | (env.esgs_slots << 8) | (env.gs_in_vertices << 16) | (env.gs_out_prim << 24));
++        h.add(env.gsvs_vertex_slots);
++    } else {
++        h.add(linked);
++        for (int k = 0; k < env.ps_input_count; ++k) {
++            const auto& in = env.ps_inputs[k];
++            if (linked & (1u << k)) {
++                h.add(k | (in.flat << 8) | (in.linear << 9) | (in.centroid << 10) | (in.point_sprite << 11));
++            } else {
++                h.add(k | (in.default_value << 12) | (in.point_sprite << 11) | 0x10000u);
++            }
++        }
++        h.add(env.ps_front_face | (env.ps_front_face_all_bits << 1) | (env.ps_front_face_gpr << 2) |
++              (env.ps_front_face_chan << 10));
++        h.add(static_cast<uint8_t>(env.ps_param_gen_gpr) | (env.point_sprite_top_1 << 8) |
++              (env.point_sprite_override[0] << 9) | (env.point_sprite_override[1] << 12) |
++              (env.point_sprite_override[2] << 15) | (env.point_sprite_override[3] << 18));
++        h.add(env.cb_shader_mask);
++        h.add(env.multiwrite);
++        for (TextureKind k : env.color_kind) h.add(static_cast<uint8_t>(k));
++        h.add(env.alpha_func);
++        // The header declares the stream-out buffer type for every stage while stream-out is on (the old key
++        // left this out for pixel shaders: same module either way, but then the texts are not equal).
++        h.add(env.stream_out_mask != 0);
++    }
++    return h.h;
++}
++
+ } // namespace cafe::latte
+diff --git a/runtime/src/latte/program.h b/runtime/src/latte/program.h
+index f423c21..29e6220 100644
+--- a/runtime/src/latte/program.h
++++ b/runtime/src/latte/program.h
+@@ -147,6 +147,8 @@ struct Program {
+     std::vector<std::vector<AluGroup>> alu_clauses;
+     std::vector<std::vector<TexInstruction>> tex_clauses;
+     std::vector<std::vector<VtxInstruction>> vtx_clauses;
++    // port/patch_shader_key_canon.py: texture resources named by a texture instruction (not vertex fetches)
++    uint32_t sampled_slots = 0;
+ 
+     const CfInstruction* at(uint32_t index) const; // null if not decoded
+ };
 diff --git a/runtime/src/latte/shader_abi.h b/runtime/src/latte/shader_abi.h
 index b7d2160..2da90ec 100644
 --- a/runtime/src/latte/shader_abi.h
@@ -5855,7 +6251,7 @@ index 1e9f5d4..5d1e9a1 100644
 +
  } // namespace cafe::latte
 diff --git a/runtime/src/latte/translate.h b/runtime/src/latte/translate.h
-index e8d1b9e..4e0238b 100644
+index e8d1b9e..6f36988 100644
 --- a/runtime/src/latte/translate.h
 +++ b/runtime/src/latte/translate.h
 @@ -26,6 +26,13 @@ enum class Stage : uint8_t { kVertex, kPixel };
@@ -5901,7 +6297,15 @@ index e8d1b9e..4e0238b 100644
      uint32_t constant_bank_mask = 0; // uniform blocks (kcache banks) read
      uint32_t constant_bank_extent[16] = {}; // bytes of each read from its start (UINT32_MAX: any, relative index)
      uint32_t buffer_mask = 0;        // buffer resources fetched from (VTX_FETCH in TEX clauses)
-@@ -107,5 +126,8 @@ uint64_t environment_key(const ShaderEnvironment& env);
+@@ -102,10 +121,16 @@ void build_environment(const uint32_t* regs, Stage stage, ShaderEnvironment& env
+ 
+ // A hash of the parts of `env` that the translation of its stage depends on.
+ uint64_t environment_key(const ShaderEnvironment& env);
++// port/patch_shader_key_canon.py: the same for a program that names only the texture slots in `sampled_slots`,
++// with the link between the stages reduced to what the translation reads.
++uint64_t environment_key(const ShaderEnvironment& env, uint32_t sampled_slots);
+ 
+ // `fetch` is the fetch shader a vertex shader calls (CALL_FS), or null.
  // Returns false with a message for microcode the translator cannot handle.
  bool translate(const Program& program, const Program* fetch, const ShaderEnvironment& env, TranslatedShader& out,
                 std::string& error);
@@ -5948,7 +6352,7 @@ index ec0c7ac..2080905 100644
      const uint64_t now = cafe_ppc_timebase();
      if (period != 0 && when < now) when += (now - when + period - 1) / period * period;
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
-index efe3675..91c3676 100644
+index efe3675..e0fd30b 100644
 --- a/runtime/src/os/ax.cpp
 +++ b/runtime/src/os/ax.cpp
 @@ -68,8 +68,9 @@ struct Voice {
@@ -5963,15 +6367,28 @@ index efe3675..91c3676 100644
      uint32_t ratio = 0x10000;
      // Interpolation between the last two samples read.
      double phase = 0;
-@@ -81,6 +82,7 @@ struct Voice {
+@@ -81,15 +82,28 @@ struct Voice {
      int16_t coefs[16]{};
      uint16_t pred_scale = 0;
      int32_t yn1 = 0, yn2 = 0;
 +    uint32_t loop_count = 0; // times the voice went back to its loop start
++    // port/patch_ax_stream_voice.py: AXSetVoiceType 1 = stream: the loop jump is a seam inside one continuous sound.
++    bool stream = false;
++    // The last loop jump went to a position beyond `end` (a stream player moves the end afterwards): play on.
++    bool ahead = false;
      uint16_t loop_pred_scale = 0;
      int32_t loop_yn1 = 0, loop_yn2 = 0;
  };
-@@ -90,6 +92,7 @@ Voice g_voices[kVoiceCount];
+ 
++// port/patch_ax_stream_voice.py: TTT2_AX_STREAM_LOOP=0 = old behaviour (stream voices reload yn1/yn2 at the loop).
++const bool g_stream_loop = [] {
++    const char* e = std::getenv("TTT2_AX_STREAM_LOOP");
++    return !(e && e[0] == '0');
++}();
++uint64_t g_stream_seams = 0;
++
+ std::recursive_mutex g_ax_mutex;
+ Voice g_voices[kVoiceCount];
  bool g_initialized = false;
  uint32_t g_frame_callback = 0;
  uint32_t g_frame_callback2 = 0;
@@ -5979,7 +6396,7 @@ index efe3675..91c3676 100644
  uint32_t g_aux_callbacks[3][2]{};
  uint32_t g_final_mix_callbacks[2]{};
  uint16_t g_master_volume = 0x8000;
-@@ -109,15 +112,26 @@ FinalMix g_final_mix[2] = {{kTvChannels, 1}, {kDrcChannels, 2}};
+@@ -109,15 +123,26 @@ FinalMix g_final_mix[2] = {{kTvChannels, 1}, {kDrcChannels, 2}};
  
  // ADPCM addresses count nibbles; every 16-nibble frame starts with a 2-nibble
  // header, leaving 14 samples.
@@ -6011,7 +6428,7 @@ index efe3675..91c3676 100644
  
  Voice* voice_of(uint32_t vpb) {
      if (vpb == 0) return nullptr;
-@@ -133,8 +147,9 @@ void publish_state(const Voice& v) {
+@@ -133,8 +158,9 @@ void publish_state(const Voice& v) {
  // ------------------------------------------------------------- mixing
  
  float decode_adpcm(Voice& v) {
@@ -6023,7 +6440,7 @@ index efe3675..91c3676 100644
      if (index == 0) v.pred_scale = *guest<uint8_t>(frame_address);
      const uint8_t byte = *guest<uint8_t>(frame_address + 1 + index / 2);
      int32_t nibble = index % 2 == 0 ? byte >> 4 : byte & 0xF;
-@@ -155,15 +170,16 @@ float next_sample(Voice& v) {
+@@ -155,19 +181,34 @@ float next_sample(Voice& v) {
      float s;
      switch (v.format) {
      case kPcm16:
@@ -6035,14 +6452,35 @@ index efe3675..91c3676 100644
      case kAdpcm: s = decode_adpcm(v); break;
      default: s = 0.0f; break;
      }
-     if (v.cursor >= v.end) {
+-    if (v.cursor >= v.end) {
++    // port/patch_ax_stream_voice.py: the end is one position (the DSP compares for equality). A voice whose loop
++    // jump landed beyond the end plays on until the title has moved the end; any other voice beyond its end ends.
++    if (v.cursor <= v.end) v.ahead = false;
++    if (v.cursor == v.end || (v.cursor > v.end && !v.ahead)) {
          if (v.loop) {
              v.cursor = v.loop_start;
++            v.ahead = g_stream_loop && v.loop_start > v.end;
 +            ++v.loop_count;
              if (v.format == kAdpcm) {
++                // port/patch_ax_stream_voice.py: a stream voice continues one sound across the jump - the samples
++                // just decoded are the history of what follows; only the predictor/scale comes from the loop context.
++                if (g_trace && v.stream && (++g_stream_seams & 63) == 1) {
++                    AX_TRACE("stream seam #%llu voice %08X -> sample %lld: history %d/%d, loop context %d/%d (%s)\n",
++                             static_cast<unsigned long long>(g_stream_seams), v.vpb,
++                             static_cast<long long>(v.loop_start), v.yn1, v.yn2, v.loop_yn1, v.loop_yn2,
++                             g_stream_loop ? "history kept" : "history replaced");
++                }
                  v.pred_scale = v.loop_pred_scale;
-                 v.yn1 = v.loop_yn1;
-@@ -317,13 +333,14 @@ void* ax_main(void*) {
+-                v.yn1 = v.loop_yn1;
+-                v.yn2 = v.loop_yn2;
++                if (!(v.stream && g_stream_loop)) {
++                    v.yn1 = v.loop_yn1;
++                    v.yn2 = v.loop_yn2;
++                }
+             }
+         } else {
+             v.running = false;
+@@ -317,13 +358,14 @@ void* ax_main(void*) {
      float output[2 * kOutputSamples];
      for (;;) {
          wait_for_frame(next);
@@ -6058,7 +6496,7 @@ index efe3675..91c3676 100644
              final_mix[0] = g_final_mix_callbacks[0];
              final_mix[1] = g_final_mix_callbacks[1];
          }
-@@ -333,6 +350,9 @@ void* ax_main(void*) {
+@@ -333,6 +375,9 @@ void* ax_main(void*) {
          lock.unlock();
          if (callback) call_guest(t->ctx, callback, {});
          if (callback2) call_guest(t->ctx, callback2, {});
@@ -6068,7 +6506,7 @@ index efe3675..91c3676 100644
          lock.lock();
          bool held = false;
          release_interrupt_lock_for_wait(t, held);
-@@ -449,9 +469,9 @@ void AXSetVoiceOffsets(uint32_t vpb, const Offsets* o) {
+@@ -449,9 +494,9 @@ void AXSetVoiceOffsets(uint32_t vpb, const Offsets* o) {
      v->format = o->format;
      v->loop = o->loop_flag != 0;
      v->samples = o->samples;
@@ -6081,7 +6519,23 @@ index efe3675..91c3676 100644
      v->phase = 0;
      v->previous = v->current = 0;
      if (v->format != kPcm16 && v->format != kPcm8 && v->format != kAdpcm) {
-@@ -622,6 +642,17 @@ void AXSetAuxCReturnVolume(uint16_t) {}
+@@ -552,7 +597,14 @@ int32_t AXSetVoiceDeviceMix(uint32_t vpb, uint32_t device, uint32_t index, const
+ }
+ 
+ void AXSetVoiceSrcType(uint32_t, uint32_t) {}
+-void AXSetVoiceType(uint32_t, uint32_t) {}
++// port/patch_ax_stream_voice.py: 0 = normal, 1 = stream (see next_sample's loop jump).
++void AXSetVoiceType(uint32_t vpb, uint32_t type) {
++    std::lock_guard lock(g_ax_mutex);
++    if (Voice* v = voice_of(vpb)) {
++        v->stream = type == 1;
++        AX_TRACE("voice type %08X %u\n", vpb, type);
++    }
++}
+ void AXSetVoiceLpf(uint32_t, uint32_t) {}
+ void AXSetVoiceLpfCoefs(uint32_t, uint32_t, uint32_t) {}
+ void AXSetVoiceBiquad(uint32_t, uint32_t) {}
+@@ -622,6 +674,17 @@ void AXSetAuxCReturnVolume(uint16_t) {}
  
  } // namespace
  
@@ -6099,7 +6553,7 @@ index efe3675..91c3676 100644
  void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
      std::lock_guard lock(g_ax_mutex);
      if (Voice* v = voice_of(vpb)) {
-@@ -630,7 +661,142 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
+@@ -630,7 +693,143 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
      }
  }
  
@@ -6157,17 +6611,18 @@ index efe3675..91c3676 100644
 +    }
 +}
 +void AXSetVoiceCurrentOffset(uint32_t vpb, uint32_t offset) { AXSetVoiceCurrentOffsetEx(vpb, offset, 0); }
-+uint32_t AXGetVoiceCurrentOffsetEx(uint32_t vpb, be<uint32_t>* offset, uint32_t samples) {
++// port/patch_ax_current_offset_ex.py: (voice, samples) -> the position relative to `samples`. It has no output
++// pointer: the old three-argument guess wrote the position INTO the title's sample data and returned 0.
++uint32_t AXGetVoiceCurrentOffsetEx(uint32_t vpb, uint32_t samples) {
 +    std::lock_guard lock(g_ax_mutex);
 +    Voice* v = voice_of(vpb);
-+    if (v == nullptr || offset == nullptr) return 0xFFFFFFFFu;
++    if (v == nullptr) return 0;
 +    int64_t value = v->format == kAdpcm ? sample_to_nibble(v->cursor) : v->cursor;
 +    if (samples != 0 && samples != v->samples) {
 +        const int64_t bytes = int64_t{samples} - int64_t{v->samples};
 +        value -= v->format == kPcm16 ? floor_div(bytes, 2) : v->format == kAdpcm ? bytes * 2 : bytes;
 +    }
-+    *offset = static_cast<uint32_t>(value);
-+    return 0;
++    return static_cast<uint32_t>(value);
 +}
 +uint32_t AXGetVoiceLoopCount(uint32_t vpb) {
 +    std::lock_guard lock(g_ax_mutex);
@@ -6256,7 +6711,7 @@ index 0205845..c55d43d 100644
 +
  } // namespace cafe::os
 diff --git a/runtime/src/os/coreinit_misc.cpp b/runtime/src/os/coreinit_misc.cpp
-index 50b2c1e..086bfbf 100644
+index 50b2c1e..bcb81ad 100644
 --- a/runtime/src/os/coreinit_misc.cpp
 +++ b/runtime/src/os/coreinit_misc.cpp
 @@ -2,6 +2,7 @@
@@ -6320,7 +6775,17 @@ index 50b2c1e..086bfbf 100644
  }
  void OSMemoryBarrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
  void OSEnforceInorderIO() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-@@ -551,4 +565,6 @@ static void init_stdio_cleanup(uint32_t address) { g_stdio_cleanup = address; }
+@@ -407,7 +421,8 @@ void no_op() {}
+ uint32_t zero() { return 0; }
+ uint32_t im_open() { return 1; } // an IM handle the IM_ calls ignore
+ 
+-CAFE_EXPORT(coreinit, DCFlushRangeNoSync, no_op);
++// port/patch_dcflush_nosync.py: NoSync still writes the lines back for the GPU = the same notice as DCFlushRange.
++CAFE_EXPORT(coreinit, DCFlushRangeNoSync, DCFlushRange);
+ CAFE_EXPORT(coreinit, OSCoherencyBarrier, no_op);
+ CAFE_EXPORT(coreinit, OSEnableHomeButtonMenu, no_op);
+ CAFE_EXPORT(coreinit, OSIsDebuggerPresent, zero);
+@@ -551,4 +566,6 @@ static void init_stdio_cleanup(uint32_t address) { g_stdio_cleanup = address; }
  CAFE_DATA_EXPORT(coreinit, __atexit_cleanup, init_atexit_cleanup);
  CAFE_DATA_EXPORT(coreinit, __stdio_cleanup, init_stdio_cleanup);
  

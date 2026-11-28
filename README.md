@@ -66,7 +66,7 @@ own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system lang
 
 **Getestet / tested (23 Nov 2026):** `setup-windows.ps1` in an empty folder on Windows 11 (i7-13700KF, RTX 3070 Ti, 8 jobs, `-SysDir` with the tester's own Mii files): video module translated and loaded, the whole build took about 3 minutes; `Start.bat`'s program went from the title through the menus into a race at Mario Kart Stadium (57-58 frames/s with picture captures on). The translation is the same as the console build's (only the newer recompiler's `dcbf` lines differ). The same scripts were run end to end from an empty folder on 23 November 2026: Lost Levels and Mario Kart 8 on Windows 11, Lost Levels on Ubuntu 26.04 and on a fresh Ubuntu 24.04 (SDL3 built from source there), Mario Party 10 on Windows 11.
 
-## Status (25 November 2026): races run at 59-60 frames/s on a Batocera console, menu videos play also after a cup
+## Status (28 November 2026): races run at 59-60 frames/s on a Batocera console, no rainbow coins, no thump in the music
 
 | Step | State |
 | --- | --- |
@@ -125,6 +125,33 @@ the game and **not** included here: point `CAFE_SYS_DIR` at a Cemu-style `mlc01/
   trace), `patch_stall_ms.py` (`TTT2_STALL_MS`: threshold of `TTT2_TRACE_STALLS`).
 - Still open: in the rear view on Thwomp Ruins a large black wedge can appear (drawn by the blob-shadow pass; cause
   not found yet); single 30 ms frames every few seconds come from the game side finishing a frame late.
+
+## 28 November 2026: rainbow coins in long Grand Prix, the "thump" in the music, fewer shader translations
+
+- **Rainbow / dark coins and short wrong full-screen pictures** late in a Grand Prix. Cause (measured with the new
+  `TTT2_TRACE_LOSS=1`, `patch_trace_loss.py`): the render-target eviction freed two kinds of targets whose picture was
+  not in guest memory: layer 0 of the light-probe cubes before the game first bound them (faces 1-5 then came from old
+  memory: zeros = dark coins, old heap contents = coloured garbage), and targets whose last write-back had been skipped
+  (a small HDR chain: magenta or almost black screen for a moment). `patch_target_evict_safe.py` keeps both
+  (`TTT2_EVICT_SAFE=0` = old). Console, Grand Prix with targets freed after 5 s instead of 30 (same mechanism, sooner):
+  old 13 cubes from old memory and 860 freed targets "not in guest memory", new 0 and 0.
+- **"Thump ... thump"** every 0.448 s in all streamed music (one stream block). `AXSetVoiceType` was empty, so stream
+  voices lost their ADPCM history at every block seam, and the end test (`>=`) made the voice jump back
+  (`patch_ax_stream_voice.py`, `TTT2_AX_STREAM_LOOP=0` = old). `AXGetVoiceCurrentOffsetEx` has two arguments and returns
+  the position; the old version wrote 4 bytes into the sound data = a crackle at every loop of the race music
+  (`patch_ax_current_offset_ex.py`). Console recording of the game's own stream: 81 pulses in 130 s before, 0 after,
+  also 0 over a 25-minute Grand Prix; spectrum above 120 Hz equal to Cemu within 0.8 dB.
+- **Shader cache key** holds only what the translation reads (`patch_shader_key_canon.py`, from Super Mario 3D World):
+  about 1,400 instead of 7,900 cache entries in the same race.
+- **`DCFlushRangeNoSync`** now tells the renderer that the CPU wrote that memory (`patch_dcflush_nosync.py`, needed by
+  Super Mario 3D World). Mario Kart 8 calls it about 18,600 times a second; each notice walked the address-sorted
+  render-target list from "address minus the largest target" (32 MB): races fell to 46-48 frames/s on the console.
+  Render targets are now also indexed by 64 KB page (`patch_target_pages.py`, `TTT2_TARGET_PAGES=0` = old) and the
+  notices of one batch are joined (`patch_cpu_wrote_merge.py`): 59.5 again (the console's GPU thread 48 % instead of 74 %).
+- Console (Ryzen 3 4350GE), all of it together, 25 minutes of Grand Prix (three tracks) with the normal settings:
+  race 59.8 frames/s on average, slowest 10 s 55.3 (track loading), GPU memory 2.85-2.99 GB, program memory 0.53-0.56 GB,
+  no lost render target. Menus, preview videos and the character turntable unchanged.
+- Measuring tools: `patch_frame_hist.py` (frames over 25/50/100 ms per window), `patch_trace_shader_keys.py`.
 
 ## What it took
 
